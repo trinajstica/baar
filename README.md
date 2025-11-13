@@ -1,7 +1,4 @@
 Experimental project — use at your own risk.
-```
-```
-
 
 BAAR is a lightweight archiver implemented in C. The primary interface is a command-line (CLI) tool with an optional GTK4-based GUI frontend. The CLI is feature-complete and is the authoritative interface for scripting and automation; the GUI offers an interactive view with drag & drop, browsing, and common archive operations.
 
