@@ -1,0 +1,39 @@
+# Ignore test directory (private tests)
+/testiranje/
+
+# Ignore built executable
+/baar
+
+# Build artifacts
+/*.o
+/*.so
+/*.a
+/*.lo
+
+# Temporary and swap files
+*~
+*.swp
+*.swo
+
+# Editor and OS files
+.DS_Store
+.vscode/
+.idea/
+.cache/
+
+# Logs and temporary runtime files
+/tmp/
+*.log
+
+# pkg-config, coverage, etc.
+coverage/
+*.cover
+
+# Binary packages
+*.tar.gz
+*.zip
+
+# CMake and autotools
+/build/
+config.log
+config.status

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=BAAR Archiver
+Comment=Simple archiver
+Exec=baar --gui %U
+Icon=baar
+Terminal=false
+Categories=Utility;Archiving;
+StartupWMClass=si.generacija.baar
