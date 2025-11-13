@@ -200,12 +200,6 @@ Run GUI:
 - Archive layout: data blobs are written first and a JSON-like index is written at the end; the header contains a pointer to the index offset. This enables the CLI to quickly read the index from the end of the file.
 - Limitations: there is no authenticated encryption (no MAC/AES-GCM), some extended metadata may not be preserved, and rebuilding very large archives can be slow because the index is at the end.
 
-For more low-level implementation notes, consult the source in `src/` (notably `src/baar.c` and `src/la_bridge.c`).
-**Drag OUT (from BAAR):**
-4. **Drag files to file manager**: Click and drag files from BAAR to Nautilus/desktop to extract them
-   - Files are temporarily extracted to `/tmp/baar_drag_<pid>/`
-
-
 # Installation and Running
 
 ## Requirements
