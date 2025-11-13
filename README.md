@@ -1,39 +1,7 @@
 Experimental project — use at your own risk.
 ```
-make
 ```
 
-Install to system locations:
-
-By default `make install` installs files under the chosen prefix (default: `/usr/local`).
-You can override the prefix like this: `sudo make prefix=/usr install`.
-
-Typical install destinations (where `${prefix}` defaults to `/usr/local`):
-
-- Binary:
-    - ${prefix}/bin/baar
-- Desktop entry (desktop file):
-    - ${prefix}/share/applications/baar.desktop
-- AppStream / metainfo (if present):
-    - ${prefix}/share/metainfo/baar.xml
-- Man pages (if provided by the build):
-    - ${prefix}/share/man/man1/baar.1
-- Icons and other shared data (only if the project provides them):
-    - ${prefix}/share/icons/hicolor/<size>/apps/
-    - ${prefix}/share/icons/...
-
-Install / uninstall commands:
-
-```
-# Install the built binary and resources to system locations (default: /usr/local)
-sudo make install
-
-# To use a different prefix (for example /usr):
-sudo make prefix=/usr install
-
-# To uninstall the files previously installed by `make install`:
-sudo make uninstall
-```
 
 BAAR is a lightweight archiver implemented in C. The primary interface is a command-line (CLI) tool with an optional GTK4-based GUI frontend. The CLI is feature-complete and is the authoritative interface for scripting and automation; the GUI offers an interactive view with drag & drop, browsing, and common archive operations.
 
@@ -166,6 +134,38 @@ Build with make (requires development packages listed below):
 
 ```
 make
+```
+
+Install to system locations:
+
+By default `make install` installs files under the chosen prefix (default: `/usr/local`).
+You can override the prefix like this: `sudo make prefix=/usr install`.
+
+Typical install destinations (where `${prefix}` defaults to `/usr/local`):
+
+- Binary:
+    - ${prefix}/bin/baar
+- Desktop entry (desktop file):
+    - ${prefix}/share/applications/baar.desktop
+- AppStream / metainfo (if present):
+    - ${prefix}/share/metainfo/baar.xml
+- Man pages (if provided by the build):
+    - ${prefix}/share/man/man1/baar.1
+- Icons and other shared data (only if the project provides them):
+    - ${prefix}/share/icons/hicolor/<size>/apps/
+    - ${prefix}/share/icons/...
+
+Install / uninstall commands:
+
+```
+# Install the built binary and resources to system locations (default: /usr/local)
+sudo make install
+
+# To use a different prefix (for example /usr):
+sudo make prefix=/usr install
+
+# To uninstall the files previously installed by `make install`:
+sudo make uninstall
 ```
 
 ### Requirements (development packages)
