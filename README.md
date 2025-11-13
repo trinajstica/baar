@@ -5,6 +5,25 @@ make
 
 Install to system locations:
 
+By default `make install` installs files under the chosen prefix (default: `/usr/local`).
+You can override the prefix like this: `sudo make prefix=/usr install`.
+
+Typical install destinations (where `${prefix}` defaults to `/usr/local`):
+
+- Binary:
+    - ${prefix}/bin/baar
+- Desktop entry (desktop file):
+    - ${prefix}/share/applications/baar.desktop
+- AppStream / metainfo (if present):
+    - ${prefix}/share/metainfo/baar.xml
+- Man pages (if provided by the build):
+    - ${prefix}/share/man/man1/baar.1
+- Icons and other shared data (only if the project provides them):
+    - ${prefix}/share/icons/hicolor/<size>/apps/
+    - ${prefix}/share/icons/...
+
+Install / uninstall commands:
+
 ```
 # Install the built binary and resources to system locations (default: /usr/local)
 sudo make install
@@ -147,12 +166,6 @@ Build with make (requires development packages listed below):
 
 ```
 make
-```
-
-Install to system locations:
-
-```
-/usr/local/bin
 ```
 
 ### Requirements (development packages)
