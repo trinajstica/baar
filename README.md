@@ -1,4 +1,8 @@
 
+<p align="center">
+    <img src="main.png" alt="main window">
+</p>
+
 Experimental project — use at your own risk.
 
 Note: Significant portions of this project were generated and iteratively developed with assistance from AI under the direction and guidance of the repository owner. The owner reviewed, tested, and approved the code and design decisions. This project remains experimental — use at your own risk.
