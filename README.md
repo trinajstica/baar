@@ -1,13 +1,20 @@
 Experimental project — use at your own risk.
+```
+make
+```
 
-This project is experimental and provided as a proof-of-concept. It may contain bugs,
-incomplete features, and breaking changes; it is not recommended for production use.
-Contributions and issue reports are welcome. Before relying on this software,
-please review the source code in `src/`.
+Install to system locations:
 
-This application was entirely written by an AI following the instructions of the project owner.
+```
+# Install the built binary and resources to system locations (default: /usr/local)
+sudo make install
 
-# BAAR - Simple Archiver (GTK4)
+# To use a different prefix (for example /usr):
+sudo make prefix=/usr install
+
+# To uninstall the files previously installed by `make install`:
+sudo make uninstall
+```
 
 BAAR is a lightweight archiver implemented in C. The primary interface is a command-line (CLI) tool with an optional GTK4-based GUI frontend. The CLI is feature-complete and is the authoritative interface for scripting and automation; the GUI offers an interactive view with drag & drop, browsing, and common archive operations.
 
@@ -145,7 +152,7 @@ make
 Install to system locations:
 
 ```
-
+/usr/local/bin
 ```
 
 ### Requirements (development packages)
