@@ -271,8 +271,6 @@ or for GUI:
    - Only files can be dragged out (folders are not supported)
    - Encrypted archives are not supported for drag-out
 
-For detailed drag & drop documentation, see [DRAG_AND_DROP.md](DRAG_AND_DROP.md).
-
 Notes:
 
 - Password protection uses PBKDF2 (100k iterations) + HMAC-SHA256 pseudostream (XOR with keystream blocks); CRC validates password correctness before writing files. For compatibility, set `BAAR_LEGACY_XOR=1` for legacy XOR mode.
