@@ -37,3 +37,4 @@ coverage/
 /build/
 config.log
 config.status
+.bak_comments/
