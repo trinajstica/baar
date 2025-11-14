@@ -15,6 +15,7 @@
 #endif
 #define _GNU_SOURCE
 #include "la_bridge.h"
+#define BAAR_HEADER "BAAR v0.28, \xC2\xA9 BArko, 2025"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,6 +40,12 @@ static void fmt_size(uint64_t n, char *out, size_t outlen) {
         ui++;
     }
     snprintf(out, outlen, "%.2f %s", v, units[ui]);
+}
+
+static const char* strip_leading_slashes(const char *s) {
+    if (!s) return s;
+    while (*s == '/') s++;
+    return s;
 }
 
 static void sanitize_temp_component(const char *input, char *out, size_t out_sz) {
@@ -226,19 +233,20 @@ int la_list(const char *archive_path, bool json_output, bool verbose) {
     int entry_count = 0;
     while (archive_read_next_header(a, &entry) == ARCHIVE_OK) {
         const char *name = archive_entry_pathname(entry);
+        const char *tname = strip_leading_slashes(name);
         int64_t size = archive_entry_size(entry);
         mode_t mode = archive_entry_mode(entry);
 
         if (json_output) {
             if (entry_count > 0) printf(",\n");
-            printf("  {\"name\":\"%s\",\"size\":%lld,\"mode\":%o}",
-                   name, (long long)size, mode);
+                 printf("  {\"name\":\"%s\",\"size\":%lld,\"mode\":%o}",
+                     tname ? tname : "", (long long)size, mode);
         } else if (verbose) {
             char sz[64];
             fmt_size(size, sz, sizeof(sz));
-            printf("%-50s %12s %12s %04o\n", name, sz, "-", mode & 0777);
+            printf("%-50s %12s %12s %04o\n", tname ? tname : "", sz, "-", mode & 0777);
         } else {
-            printf("  %s\n", name);
+            printf("  %s\n", tname ? tname : "");
         }
 
         entry_count++;
@@ -324,7 +332,7 @@ int la_extract(const char *archive_path, const char *dest_dir, const char *passw
                 fprintf(stderr, "Error reading %s: %s\n", name, archive_error_string(a));
                 errors++;
             } else {
-                printf("  %s\n", name);
+                printf("  %s\n", strip_leading_slashes(name) ? strip_leading_slashes(name) : "");
                 extracted++;
             }
         }
@@ -384,8 +392,9 @@ int la_extract_single(const char *archive_path, const char *entry_name,
     int rcode;
     while ((rcode = archive_read_next_header(a, &entry)) == ARCHIVE_OK) {
         const char *name = archive_entry_pathname(entry);
+        const char *tname = strip_leading_slashes(name);
 
-        if (strcmp(name, entry_name) == 0) {
+        if ((tname && strcmp(tname, entry_name) == 0) || strcmp(name, entry_name) == 0) {
             found = true;
 
             r = archive_write_header(ext, entry);
@@ -413,7 +422,7 @@ int la_extract_single(const char *archive_path, const char *entry_name,
                     archive_write_free(ext);
                     return 1;
                 }
-                printf("Extracted: %s\n", name);
+                printf("Extracted: %s\n", strip_leading_slashes(name) ? strip_leading_slashes(name) : "");
             }
 
             archive_write_finish_entry(ext);
@@ -473,8 +482,9 @@ int la_extract_to_path(const char *archive_path, const char *entry_name,
     int rcode;
     while ((rcode = archive_read_next_header(a, &entry)) == ARCHIVE_OK) {
         const char *name = archive_entry_pathname(entry);
+        const char *tname = strip_leading_slashes(name);
 
-        if (strcmp(name, entry_name) == 0) {
+        if ((tname && strcmp(tname, entry_name) == 0) || strcmp(name, entry_name) == 0) {
             found = true;
 
 
@@ -557,14 +567,14 @@ int la_test(const char *archive_path, const char *password) {
         }
 
         if (r != ARCHIVE_EOF) {
-            fprintf(stderr, "  FAIL: %s - %s\n", name, archive_error_string(a));
+            fprintf(stderr, "  FAIL: %s - %s\n", strip_leading_slashes(name) ? strip_leading_slashes(name) : "", archive_error_string(a));
             errors++;
         } else if (expected_size >= 0 && actual_size != expected_size) {
-            fprintf(stderr, "  FAIL: %s - size mismatch (expected %lld, got %lld)\n",
-                    name, (long long)expected_size, (long long)actual_size);
+                fprintf(stderr, "  FAIL: %s - size mismatch (expected %lld, got %lld)\n",
+                    strip_leading_slashes(name) ? strip_leading_slashes(name) : "", (long long)expected_size, (long long)actual_size);
             errors++;
         } else {
-            printf("  OK: %s\n", name);
+            printf("  OK: %s\n", strip_leading_slashes(name) ? strip_leading_slashes(name) : "");
         }
 
         tested++;
@@ -578,7 +588,7 @@ int la_test(const char *archive_path, const char *password) {
 
 
 int la_add_files(const char *archive_path, const char **file_paths,
-                 int file_count, int compression_level, const char *password) {
+                 int file_count, int compression_level, const char *password, int verbose) {
     if (file_count == 0) {
         fprintf(stderr, "Error: no files to add\n");
         return 1;
@@ -596,7 +606,7 @@ int la_add_files(const char *archive_path, const char **file_paths,
         }
     }
 
-
+    
     char temp_path[PATH_MAX];
     if (make_temp_file_path_near_archive(archive_path, "tmp", temp_path, sizeof(temp_path)) != 0) {
         fprintf(stderr, "Error: unable to create temporary path for archive %s\n", archive_path);
@@ -621,6 +631,7 @@ int la_add_files(const char *archive_path, const char **file_paths,
         argv[ai++] = "zip";
         argv[ai++] = "-P";
         argv[ai++] = (char*)password;
+        if (!verbose) argv[ai++] = "-q";
         argv[ai++] = "-j";
         argv[ai++] = (char*)archive_path;
         for (int i = 0; i < file_count; i++) argv[ai++] = (char*)file_paths[i];
@@ -707,7 +718,7 @@ int la_add_files(const char *archive_path, const char **file_paths,
 
 
     if (archive_exists) {
-        printf("Archive exists, recreating with new files...\n");
+        fprintf(stderr, "Archive exists, recreating with new files...\n");
 
         struct archive *in = archive_read_new();
         archive_read_support_filter_all(in);
@@ -760,6 +771,12 @@ int la_add_files(const char *archive_path, const char **file_paths,
     }
 
 
+    if (!verbose && file_count > 0) {
+        fprintf(stderr, "%s\n", BAAR_HEADER);
+        fprintf(stderr, "Adding %d files: ", file_count);
+        fflush(stderr);
+    }
+
     for (int i = 0; i < file_count; i++) {
         const char *file_path = file_paths[i];
 
@@ -800,7 +817,8 @@ int la_add_files(const char *archive_path, const char **file_paths,
             }
 
             close(fd);
-            printf("  Added: %s\n", file_path);
+            if (verbose) fprintf(stderr, "  Added: %s\n", file_path);
+            else { fprintf(stderr, "\rAdding %d files: %s", file_count, file_path); fflush(stderr); }
         }
 
         archive_entry_free(entry);
@@ -824,7 +842,7 @@ int la_add_files(const char *archive_path, const char **file_paths,
                 }
                 fclose(src); fclose(dst);
                 unlink(temp_path);
-                printf("\nArchive updated (copy): %s\n", archive_path);
+                fprintf(stderr, "\nArchive updated (copy): %s\n", archive_path);
                 return 0;
             } else {
                 fprintf(stderr, "Error: cannot copy archive: %s\n", strerror(errno));
@@ -840,6 +858,7 @@ int la_add_files(const char *archive_path, const char **file_paths,
         }
     }
 
-    printf("\nArchive updated: %s\n", archive_path);
+    if (!verbose && file_count > 0) fprintf(stderr, "\n");
+    fprintf(stderr, "\nArchive updated: %s\n", archive_path);
     return 0;
 }

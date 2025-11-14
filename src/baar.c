@@ -1,4 +1,4 @@
-#define BAAR_HEADER "BAAR v0.24, \xC2\xA9 BArko, 2025"
+#define BAAR_HEADER "BAAR v0.28, \xC2\xA9 BArko, 2025"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -83,13 +83,14 @@ static void xor_buf(unsigned char *buf, size_t len, const char *pwd);
 
 
 static int global_quiet = 0;
+static int global_verbose = 0;
 
 static void usage(){
     fprintf(stderr,
         BAAR_HEADER
         "\n\n"
         "Usage:\n"
-        "  baar a <archive> [files...] [-c 0|1|2|3|4] [-p password]\n"
+        "  baar a <archive> [files...] [-c 0|1|2|3|4] [-p password] [-v|--verbose]\n"
         "    Add files or directories to <archive> (.baar is appended if missing).\n"
         "    Files may be specified as src:dst to control the archive path or src:level to set per-file compression.\n"
         "    Use --incremental (-i) and/or --mirror (-m) to mirror provided paths: skip unchanged files and remove entries missing on disk.\n"
@@ -152,9 +153,6 @@ typedef struct {
 static int add_files_streaming(const char *archive, add_job_t *jobs, int job_count,
                                const char *pwd, int incremental_mode, int mirror_mode,
                                char **ignore_patterns, size_t ignore_count);
-
-
-
 static GtkWidget *g_main_window = NULL;
 static GtkWidget *g_list_container = NULL;
 static GtkWidget *g_welcome_label = NULL;
@@ -1235,12 +1233,12 @@ static void on_add_files_response(GtkDialog *dialog, int response_id, gpointer d
 
                     {
                         const char *usepwd = password ? password : g_archive_password;
-                        int lar = la_add_files(g_current_archive, file_paths, nfiles, 2, usepwd);
+                        int lar = la_add_files(g_current_archive, file_paths, nfiles, 2, usepwd, global_verbose);
                         if(lar != 0 && !usepwd && g_main_window){
 
                             if(show_password_dialog("Adding files failed (archive may be encrypted). Enter password to retry:")){
                                 if(g_archive_password && g_archive_password[0]) g_archive_was_encrypted = 1;
-                                la_add_files(g_current_archive, file_paths, nfiles, 2, g_archive_password);
+                                la_add_files(g_current_archive, file_paths, nfiles, 2, g_archive_password, global_verbose);
                             }
                         }
                     }
@@ -3356,11 +3354,11 @@ static gboolean on_drop(GtkDropTarget *target, const GValue *value, double x, do
 
                 int avg_clevel = 6;
 
-                int lar = la_add_files(g_current_archive, file_paths, total_files, avg_clevel, g_archive_password);
+                int lar = la_add_files(g_current_archive, file_paths, total_files, avg_clevel, g_archive_password, global_verbose);
                 if(lar != 0 && !g_archive_password && g_main_window){
                     if(show_password_dialog("Adding files failed (archive may be encrypted). Enter password to retry:")){
                         if(g_archive_password && g_archive_password[0]) g_archive_was_encrypted = 1;
-                        lar = la_add_files(g_current_archive, file_paths, total_files, avg_clevel, g_archive_password);
+                        lar = la_add_files(g_current_archive, file_paths, total_files, avg_clevel, g_archive_password, global_verbose);
                     }
                 }
                 if(lar == 0){
@@ -3626,11 +3624,11 @@ static gboolean on_drop(GtkDropTarget *target, const GValue *value, double x, do
 
 
             const char *la_pwd = password_copy ? password_copy : g_archive_password;
-            int lar = la_add_files(g_current_archive, paths, total_files, avg_clevel, la_pwd);
+            int lar = la_add_files(g_current_archive, paths, total_files, avg_clevel, la_pwd, global_verbose);
             if(lar != 0 && !la_pwd && g_main_window){
                 if(show_password_dialog("Adding files failed (archive may be encrypted). Enter password to retry:")){
                     if(g_archive_password && g_archive_password[0]) g_archive_was_encrypted = 1;
-                    lar = la_add_files(g_current_archive, paths, total_files, avg_clevel, g_archive_password);
+                    lar = la_add_files(g_current_archive, paths, total_files, avg_clevel, g_archive_password, global_verbose);
                 }
             }
             if(lar == 0){
@@ -5270,6 +5268,16 @@ static index_t load_index(FILE *f){
     e->name = malloc(namelen+1);
     fread(e->name,1,namelen,f);
     e->name[namelen]=0;
+    /* strip leading slashes so UI shows top-level folders like 'home' instead of '/' */
+    if(e->name && e->name[0] == '/'){
+        char *tmp = e->name;
+        while(tmp[0] == '/') tmp++;
+        if(tmp != e->name){
+            char *newn = strdup(tmp);
+            free(e->name);
+            e->name = newn ? newn : strdup("");
+        }
+    }
     e->flags = fgetc(f);
     e->comp_level = fgetc(f);
     e->data_offset = read_u64(f);
@@ -5461,7 +5469,11 @@ static index_t load_libarchive_index(const char *path){
 
         e->id = i + 1;
         const char *pathname = archive_entry_pathname(entry);
-        e->name = strdup(pathname ? pathname : "");
+        const char *name_src = pathname ? pathname : "";
+        /* strip leading slashes so GUI doesn't create a root '/' folder for absolute paths */
+        const char *name_trim = name_src;
+        while(*name_trim == '/') name_trim++;
+        e->name = strdup(name_trim);
 
 
         int64_t size = archive_entry_size_is_set(entry) ? archive_entry_size(entry) : 0;
@@ -5909,7 +5921,7 @@ static int add_files(const char *archive, filepair_t *filepairs, int *clevels, i
             }
             pthread_t spinner_thread;
             int spinner_created = 0;
-            if(sarg && pthread_create(&spinner_thread, NULL, spinner_fn, sarg)==0){
+            if(sarg && global_verbose && pthread_create(&spinner_thread, NULL, spinner_fn, sarg)==0){
                 spinner_created = 1;
             } else if(sarg){
                 free(sarg);
@@ -6089,7 +6101,7 @@ static int process_single_file(add_stream_ctx_t *ctx,
     if(sarg){
         sarg->name = src_path;
         sarg->run = &spinner_run;
-        if(pthread_create(&spinner_thread, NULL, spinner_fn, sarg)==0){
+        if(global_verbose && pthread_create(&spinner_thread, NULL, spinner_fn, sarg)==0){
             spinner_created = 1;
         } else {
             free(sarg);
@@ -6241,7 +6253,8 @@ static int process_single_file(add_stream_ctx_t *ctx,
         if(p > 100) p = 100;
         percent = (unsigned int)p;
     }
-    fprintf(stderr, "\r%s ... (%u%%)\n", src_path, percent);
+    if(global_verbose){ fprintf(stderr, "%s ... (%u%%)\n", src_path, percent); }
+    else { fprintf(stderr, "\rAdding files: %s ... (%u%%)", src_path, percent); fflush(stderr); }
 
     if(enc_buf) free(enc_buf);
     if(out) free(out);
@@ -6438,6 +6451,12 @@ static int add_files_streaming(const char *archive, add_job_t *jobs, int job_cou
         .ignore_count = ignore_count
     };
 
+    /* Compact CLI mode: print header and a single dynamic info line under it */
+    if(!global_quiet && !global_verbose){
+        fprintf(stderr, "%s\n", BAAR_HEADER);
+        fprintf(stderr, "Adding files: "); fflush(stderr);
+    }
+
     int overall_status = 0;
     for(int i=0;i<job_count;i++){
         if(g_abort_requested) break;
@@ -6493,12 +6512,14 @@ static int add_files_streaming(const char *archive, add_job_t *jobs, int job_cou
 
     int rebuild_status = 0;
     if(!incremental_mode && remove_count > 0 && to_remove){
+        if(!global_verbose && !global_quiet) fprintf(stderr, "\n");
         rebuild_status = rebuild_archive(archive, to_remove, remove_count, global_quiet);
     }
 
     free(to_remove);
     free_index(&idx);
     if(rebuild_status != 0) overall_status = 1;
+    if(!global_verbose && !global_quiet){ fprintf(stderr, "\n"); }
     if(g_abort_requested){
         return overall_status == 0 ? 130 : overall_status;
     }
@@ -6809,11 +6830,13 @@ static int rebuild_archive(const char *archive, const uint32_t *exclude_ids, uin
         for(uint32_t j=0;j<exclude_count;j++) if(e->id==exclude_ids[j]) skip=1;
         if(skip){
             skipped_count++;
-            if(!quiet){ fprintf(stderr, "  Skipping id %u  %s\n", e->id, e->name); fflush(stderr); }
+            if(!quiet && global_verbose){ fprintf(stderr, "  Skipping id %u  %s\n", e->id, e->name); fflush(stderr); }
             continue;
         }
 
-    if(!quiet){ fprintf(stderr, "  Copying id %u  %s  (comp=%" PRIu64 ") ", e->id, e->name, e->comp_size); fflush(stderr); }
+        if(!quiet && global_verbose){ 
+            fprintf(stderr, "  Copying id %u  %s  (comp=%" PRIu64 ") ", e->id, e->name, e->comp_size); fflush(stderr);
+        }
         fseek(old, e->data_offset, SEEK_SET);
         unsigned char *buf = malloc(e->comp_size);
         fread(buf,1,e->comp_size,old);
@@ -6824,8 +6847,11 @@ static int rebuild_archive(const char *archive, const uint32_t *exclude_ids, uin
         free(buf);
 
         if(!quiet){
-            if(total_to_copy>0){ unsigned int prog = (unsigned int)(total_copied * 100ULL / total_to_copy); fprintf(stderr, "(%u%%)\n", prog); }
-            else fprintf(stderr, "\n");
+            if(total_to_copy>0){ unsigned int prog = (unsigned int)(total_copied * 100ULL / total_to_copy);
+                if(global_verbose) fprintf(stderr, "(%u%%)\n", prog);
+                else { fprintf(stderr, "(%u%%)", prog); fflush(stderr); }
+            }
+            else { if(global_verbose) fprintf(stderr, "\n"); else { fprintf(stderr, "\r"); fflush(stderr); } }
         }
 
 
@@ -7021,6 +7047,18 @@ int main(int argc, char **argv){
         }
     }
 
+    /* Handle global flags that may appear anywhere; remove them from argv so they
+       are not treated as job/file paths later. */
+    for(int gi=1; gi<argc; gi++){
+        if(strcmp(argv[gi], "--verbose") == 0 || strcmp(argv[gi], "-v") == 0){
+            global_verbose = 1;
+            /* shift argv left to remove this flag */
+            for(int sj = gi; sj < argc - 1; sj++) argv[sj] = argv[sj+1];
+            argv[argc-1] = NULL; argc--; gi--; 
+        }
+    }
+    (void)global_verbose; // no-op to avoid unused variable warnings in builds without debug
+
     if(argc<3){ usage(); return 1; }
     const char *cmd = argv[1];
     const char *archive_arg = argv[2];
@@ -7076,6 +7114,8 @@ int main(int argc, char **argv){
                 i++;
             } else if (strcmp(argv[i], "--json") == 0 || strcmp(argv[i], "-j") == 0) {
                 json = 1;
+            } else if (strcmp(argv[i], "--verbose") == 0 || strcmp(argv[i], "-v") == 0) {
+                global_verbose = 1;
             } else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
                 compression_level = atoi(argv[i + 1]);
                 i++;
@@ -7152,7 +7192,7 @@ int main(int argc, char **argv){
             }
 
             int result = la_add_files(actual_archive, file_paths, file_count,
-                                     compression_level, pwd);
+                             compression_level, pwd, global_verbose);
             free(file_paths);
             free_ignore_patterns(ignore_patterns, ignore_count);
             return result;
@@ -7185,6 +7225,7 @@ int main(int argc, char **argv){
         else if(strcmp(argv[i],"-p")==0 && i+1<argc){ pwd = argv[i+1]; i++; }
         else if(strcmp(argv[i],"--json")==0 || strcmp(argv[i],"-j")==0){ json = 1; }
         else if(strcmp(argv[i],"--quiet")==0 || strcmp(argv[i],"-q")==0){ global_quiet = 1; }
+        else if(strcmp(argv[i],"--verbose")==0 || strcmp(argv[i],"-v")==0){ global_verbose = 1; }
         else if(strcmp(argv[i],"--incremental")==0 || strcmp(argv[i],"--i")==0 || strcmp(argv[i],"-i")==0){ incremental_mode = 1; }
         else if(strcmp(argv[i],"--mirror")==0 || strcmp(argv[i],"--m")==0 || strcmp(argv[i],"-m")==0){ mirror_mode = 1; incremental_mode = 1; }
     }
@@ -7224,7 +7265,9 @@ int main(int argc, char **argv){
                 if(strcmp(argv[i],"-p")==0) { i++; continue; }
                 if(strcmp(argv[i],"--incremental")==0 || strcmp(argv[i],"--mirror")==0 || strcmp(argv[i],"--i")==0 || strcmp(argv[i],"--m")==0 || strcmp(argv[i],"-i")==0 || strcmp(argv[i],"-m")==0){ continue; }
                 if(strcmp(argv[i],"--quiet")==0 || strcmp(argv[i],"-q")==0){ continue; }
+                if(strcmp(argv[i],"--verbose")==0 || strcmp(argv[i],"-v")==0){ continue; }
                 if(strcmp(argv[i],"--ignore")==0){ i++; continue; }
+                if(argv[i][0] == '-') continue;
                 if(strncmp(argv[i], "--ignore=", 9) == 0){ continue; }
 
                 char *arg = argv[i];

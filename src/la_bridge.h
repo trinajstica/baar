@@ -43,7 +43,7 @@ int la_test(const char *archive_path, const char *password);
 
 
 int la_add_files(const char *archive_path, const char **file_paths,
-                 int file_count, int compression_level, const char *password);
+                 int file_count, int compression_level, const char *password, int verbose);
 
 
 const char *la_get_format(const char *archive_path);
