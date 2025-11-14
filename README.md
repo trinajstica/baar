@@ -20,9 +20,10 @@ The CLI supports the following subcommands and options (exact behavior implement
         - Add files or directories to `<archive>` (the `.baar` extension is appended if missing).
         - Files may be specified as `src:dst` to control the path inside the archive.
         - Per-file compression level may also be provided using `src:level` style.
-        - `--incremental` (or `--i`): Only add new or changed files. Existing files in the archive are left untouched, even if they are missing from the source.
-        - `--mirror` (or `--m`): Mirror mode. In addition to incremental behavior, any files present in the archive but missing from the source are marked as deleted (logical removal). The archive becomes a mirror of the source directory.
-        - You can combine both options: `--incremental --mirror` (or `--i --m`).
+        - `--incremental` (or `-i`): Only add new or changed files. Existing files in the archive are left untouched, even if they are missing from the source.
+        - `--mirror` (or `-m`): Mirror mode. In addition to incremental behavior, any files present in the archive but missing from the source are marked as deleted (logical removal). The archive becomes a mirror of the source directory.
+        - You can combine both options: `--incremental --mirror` (or `-i -m`). Mirror mode always implies incremental behavior.
+        - `--ignore <pattern>`: Skip files, directories, or archive paths matching the provided shell-style glob. You can repeat this option multiple times.
         - Files that cannot be read (for example due to missing permissions) are reported and left untouched.
 
 #### Examples for incremental and mirror modes
@@ -31,17 +32,22 @@ Add or update only new/changed files (incremental):
 ```sh
 ./baar a my.baar mydir --incremental
 # or using the short option:
-./baar a my.baar mydir --i
+./baar a my.baar mydir -i
 ```
 
 Mirror the source directory (add/update new/changed, mark missing as deleted):
 ```sh
 ./baar a my.baar mydir --incremental --mirror
 # or using short options:
-./baar a my.baar mydir --i --m
+./baar a my.baar mydir -i -m
 ```
 
-If you use only `--mirror`/`--m` without `--incremental`/`--i`, the effect is the same as using both (mirror always implies incremental mode).
+If you use only `--mirror`/`-m` without `--incremental`/`-i`, the effect is the same as using both (mirror always implies incremental mode).
+
+Ignore glob-matching files while archiving:
+```sh
+./baar a my.baar src --ignore "*.tmp" --ignore "build/*"
+```
 
 - Extract archive:
     - `baar x <archive> [dest_dir] [-p password]`

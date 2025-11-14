@@ -90,9 +90,10 @@ static void usage(){
         "  baar a <archive> [files...] [-c 0|1|2|3|4] [-p password]\n"
         "    Add files or directories to <archive> (.baar is appended if missing).\n"
         "    Files may be specified as src:dst to control the archive path or src:level to set per-file compression.\n"
-        "    Use --incremental (alias --i) and/or --mirror (alias --m) to mirror provided paths: skip unchanged files and remove entries missing on disk.\n"
-        "      --incremental, --i     Incremental mode: only add new/changed files.\n"
-        "      --mirror, --m         Mirror mode: also mark as deleted files missing from source.\n"
+        "    Use --incremental (-i) and/or --mirror (-m) to mirror provided paths: skip unchanged files and remove entries missing on disk.\n"
+        "      --incremental, -i     Incremental mode: only add new/changed files.\n"
+        "      --mirror, -m         Mirror mode: also mark as deleted files missing from source.\n"
+        "      --ignore PATTERN     Skip sources or archive paths matching the glob pattern (can be repeated).\n"
         "\n"
         "  baar x <archive> [dest_dir] [-p password]\n"
         "    Extract all files from <archive> into dest_dir (current dir if omitted).\n"
@@ -945,7 +946,7 @@ static void close_archive_gui(void){
 static int write_index(FILE *f, index_t *idx);
 static int update_header_index_offset(FILE *f, uint64_t index_offset);
 static int ensure_header(FILE *f);
-static int add_files(const char *archive, filepair_t *filepairs, int *clevels, int nfiles, const char *pwd, int incremental_mode);
+static int add_files(const char *archive, filepair_t *filepairs, int *clevels, int nfiles, const char *pwd, int incremental_mode, int mirror_mode);
 
 
 static void show_progress_dialog(const char *title, const char *message){
@@ -1217,7 +1218,7 @@ static void on_add_files_response(GtkDialog *dialog, int response_id, gpointer d
                 free(file_paths);
             } else {
 
-                add_files(g_current_archive, filepairs, clevels, nfiles, password, 0);
+                add_files(g_current_archive, filepairs, clevels, nfiles, password, 0, 0);
             }
 
             update_progress(0.9, "Refreshing index...");
@@ -3718,7 +3719,7 @@ static gboolean on_drop(GtkDropTarget *target, const GValue *value, double x, do
         free(dir_paths);
 
 
-        if(add_files(g_current_archive, filepairs, clevels, total_files, password_copy, 0) == 0){
+        if(add_files(g_current_archive, filepairs, clevels, total_files, password_copy, 0, 0) == 0){
             update_progress(0.9, "Refreshing index...");
 
 
@@ -4083,7 +4084,7 @@ static void on_drop_create_response(GtkDialog *dialog, gint response, gpointer u
                         }
                         free(dir_paths);
 
-                        if(add_files(final_path, filepairs, clevels, total_files, NULL, 0) == 0){
+                        if(add_files(final_path, filepairs, clevels, total_files, NULL, 0, 0) == 0){
                             update_progress(0.9, "Refreshing index...");
 
                             FILE *rf = fopen(final_path, "rb");
@@ -4803,6 +4804,61 @@ static char **collect_files_recursive(const char *path, int *out_count){
     return NULL;
 }
 
+static int add_ignore_pattern(char ***patterns, size_t *count, const char *pattern){
+    if(!patterns || !count || !pattern || !pattern[0]) return -1;
+    char *dup = strdup(pattern);
+    if(!dup) return -1;
+    char **tmp = realloc(*patterns, sizeof(char*) * (*count + 1));
+    if(!tmp){
+        free(dup);
+        return -1;
+    }
+    *patterns = tmp;
+    (*patterns)[*count] = dup;
+    (*count)++;
+    return 0;
+}
+
+static void free_ignore_patterns(char **patterns, size_t count){
+    if(!patterns) return;
+    for(size_t i=0;i<count;i++){
+        free(patterns[i]);
+    }
+    free(patterns);
+}
+
+static int should_ignore_path(const char *src_path, const char *archive_path,
+                              char **patterns, size_t pattern_count){
+    if(!patterns || pattern_count == 0) return 0;
+    const char *candidates[4];
+    size_t candidate_count = 0;
+    if(archive_path && archive_path[0]){
+        candidates[candidate_count++] = archive_path;
+    }
+    if(src_path && src_path[0]){
+        candidates[candidate_count++] = src_path;
+        const char *base = strrchr(src_path, '/');
+        if(base && base[1]){
+            candidates[candidate_count++] = base + 1;
+        }
+    } else if(archive_path && archive_path[0]){
+        const char *base = strrchr(archive_path, '/');
+        if(base && base[1]){
+            candidates[candidate_count++] = base + 1;
+        }
+    }
+    for(size_t pi=0; pi<pattern_count; pi++){
+        const char *pattern = patterns[pi];
+        if(!pattern || !pattern[0]) continue;
+        for(size_t ci=0; ci<candidate_count; ci++){
+            if(fnmatch(pattern, candidates[ci], 0) == 0){
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 
 typedef struct { const char *name; volatile int *run; } spinner_arg_t;
 static void *spinner_fn(void *arg){
@@ -5272,7 +5328,7 @@ static void append_unique_id(uint32_t **arr, uint32_t *count, uint32_t id){
     (*count)++;
 }
 
-static int add_files(const char *archive, filepair_t *filepairs, int *clevels, int nfiles, const char *pwd, int incremental_mode){
+static int add_files(const char *archive, filepair_t *filepairs, int *clevels, int nfiles, const char *pwd, int incremental_mode, int mirror_mode){
 
     FILE *f = fopen(archive, "r+b");
     if(!f) f = fopen(archive, "w+b");
@@ -5355,7 +5411,7 @@ static int add_files(const char *archive, filepair_t *filepairs, int *clevels, i
                 }
             }
 
-            if(incremental_mode){
+            if(mirror_mode){
                 if(plan->counts_for_desired && filepairs[i].archive_path && desired_valid){
                     char **tmp = realloc(desired_names, sizeof(char*) * (desired_count + 1));
                     if(!tmp){
@@ -5365,7 +5421,9 @@ static int add_files(const char *archive, filepair_t *filepairs, int *clevels, i
                         desired_names[desired_count++] = filepairs[i].archive_path;
                     }
                 }
+            }
 
+            if(incremental_mode){
                 if(plan->stat_ok && plan->readable && plan->existing_valid){
                     if(plan->existing_uncomp == (uint64_t)plan->st.st_size &&
                        plan->existing_mtime == (uint64_t)plan->st.st_mtime &&
@@ -5380,7 +5438,7 @@ static int add_files(const char *archive, filepair_t *filepairs, int *clevels, i
                 fprintf(stderr, "Skipping %s: %s\n", src, msg);
             }
 
-            if(mirror_debug && incremental_mode){
+            if(mirror_debug && mirror_mode){
                 fprintf(stderr, "[BAAR mirror plan] %s action=%d existing=%u stat_ok=%d readable=%d size=%lld/%" PRIu64 " mtime=%lld/%" PRIu64 "\n",
                         src,
                         plan->action,
@@ -5398,7 +5456,7 @@ static int add_files(const char *archive, filepair_t *filepairs, int *clevels, i
     uint32_t *to_remove = NULL;
     uint32_t remove_count = 0;
 
-    if(incremental_mode && desired_valid){
+    if(mirror_mode && desired_valid){
         if(desired_count > 1 && desired_names){
             qsort(desired_names, desired_count, sizeof(char*), compare_str_ptr);
         }
@@ -5427,13 +5485,13 @@ static int add_files(const char *archive, filepair_t *filepairs, int *clevels, i
     free(entry_lookup);
     entry_lookup = NULL;
 
-    if(mirror_debug && incremental_mode){
+    if(mirror_debug && mirror_mode){
         fprintf(stderr, "[BAAR mirror] desired=%zu remove=%u valid=%d\n", desired_count, remove_count, desired_valid);
     }
 
     if(incremental_mode){
         if(remove_count > 0 && to_remove){
-            if(!global_quiet){
+            if(!global_quiet && mirror_mode){
                 fprintf(stderr, "Mirror: marking %u entries as deleted\n", remove_count);
             }
             for(uint32_t i=0;i<remove_count;i++){
@@ -6223,7 +6281,7 @@ int main(int argc, char **argv){
             } else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
                 compression_level = atoi(argv[i + 1]);
                 i++;
-            } else if (strcmp(argv[i], "--incremental") == 0 || strcmp(argv[i], "--mirror") == 0 || strcmp(argv[i], "--i") == 0 || strcmp(argv[i], "--m") == 0) {
+            } else if (strcmp(argv[i], "--incremental") == 0 || strcmp(argv[i], "--mirror") == 0 || strcmp(argv[i], "--i") == 0 || strcmp(argv[i], "--m") == 0 || strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "-m") == 0) {
                 fprintf(stderr, "--incremental/--mirror are only available for native BAAR archives.\n");
                 return 1;
             }
@@ -6248,19 +6306,57 @@ int main(int argc, char **argv){
 
             int file_count = 0;
             const char **file_paths = malloc(sizeof(char*) * (argc - 3));
+            char **ignore_patterns = NULL;
+            size_t ignore_count = 0;
+
+            for (int i = 3; i < argc; i++) {
+                if (strcmp(argv[i], "--ignore") == 0) {
+                    if (i + 1 >= argc) {
+                        fprintf(stderr, "--ignore requires a pattern\n");
+                        free(file_paths);
+                        free_ignore_patterns(ignore_patterns, ignore_count);
+                        return 1;
+                    }
+                    if (add_ignore_pattern(&ignore_patterns, &ignore_count, argv[i + 1]) != 0) {
+                        fprintf(stderr, "Failed to store ignore pattern\n");
+                        free(file_paths);
+                        free_ignore_patterns(ignore_patterns, ignore_count);
+                        return 1;
+                    }
+                    i++;
+                } else if (strncmp(argv[i], "--ignore=", 9) == 0) {
+                    if (add_ignore_pattern(&ignore_patterns, &ignore_count, argv[i] + 9) != 0) {
+                        fprintf(stderr, "Failed to store ignore pattern\n");
+                        free(file_paths);
+                        free_ignore_patterns(ignore_patterns, ignore_count);
+                        return 1;
+                    }
+                }
+            }
 
             for (int i = 3; i < argc; i++) {
                 if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "-p") == 0) {
                     i++;
                     continue;
                 }
+                if (strcmp(argv[i], "--ignore") == 0) {
+                    i++;
+                    continue;
+                }
+                if (strncmp(argv[i], "--ignore=", 9) == 0) {
+                    continue;
+                }
                 if (argv[i][0] == '-') continue;
+                if (should_ignore_path(argv[i], argv[i], ignore_patterns, ignore_count)) {
+                    continue;
+                }
                 file_paths[file_count++] = argv[i];
             }
 
             int result = la_add_files(actual_archive, file_paths, file_count,
                                      compression_level, pwd);
             free(file_paths);
+            free_ignore_patterns(ignore_patterns, ignore_count);
             return result;
         } else {
             fprintf(stderr, "Command '%s' not supported for non-BAAR archives.\n", cmd);
@@ -6280,27 +6376,59 @@ int main(int argc, char **argv){
     }
     const char *archive = archive_buf;
 
-    int clevel = 1; const char *pwd = NULL; int json = 0; int incremental_mode = 0;
+    int clevel = 1;
+    const char *pwd = NULL;
+    int json = 0;
+    int incremental_mode = 0;
+    int mirror_mode = 0;
     for(int i=3;i<argc;i++){
         if(strcmp(argv[i],"-c")==0 && i+1<argc){ clevel = atoi(argv[i+1]); i++; }
         else if(strncmp(argv[i], "-c", 2) == 0 && isdigit((unsigned char)argv[i][2])) { clevel = atoi(argv[i]+2); }
         else if(strcmp(argv[i],"-p")==0 && i+1<argc){ pwd = argv[i+1]; i++; }
         else if(strcmp(argv[i],"--json")==0 || strcmp(argv[i],"-j")==0){ json = 1; }
         else if(strcmp(argv[i],"--quiet")==0 || strcmp(argv[i],"-q")==0){ global_quiet = 1; }
-        else if(strcmp(argv[i],"--incremental")==0 || strcmp(argv[i],"--mirror")==0 || strcmp(argv[i],"--i")==0 || strcmp(argv[i],"--m")==0){ incremental_mode = 1; }
+        else if(strcmp(argv[i],"--incremental")==0 || strcmp(argv[i],"--i")==0 || strcmp(argv[i],"-i")==0){ incremental_mode = 1; }
+        else if(strcmp(argv[i],"--mirror")==0 || strcmp(argv[i],"--m")==0 || strcmp(argv[i],"-m")==0){ mirror_mode = 1; incremental_mode = 1; }
     }
 
     if(!pwd) pwd = getenv("BAAR_PWD");
     if(strcmp(cmd,"a")==0){
 
-        filepair_t *filepairs = NULL;
-        int *levels = NULL;
-        int total = 0;
-        for(int i=3;i<argc;i++){
-            if(strcmp(argv[i],"-c")==0) { i++; continue; }
-            if(strcmp(argv[i],"-p")==0) { i++; continue; }
-            if(strcmp(argv[i],"--incremental")==0 || strcmp(argv[i],"--mirror")==0){ continue; }
-            if(strcmp(argv[i],"--quiet")==0 || strcmp(argv[i],"-q")==0){ continue; }
+            filepair_t *filepairs = NULL;
+            int *levels = NULL;
+            int total = 0;
+            char **ignore_patterns = NULL;
+            size_t ignore_count = 0;
+
+            for(int i=3;i<argc;i++){
+                if(strcmp(argv[i],"--ignore")==0){
+                    if(i+1 >= argc){
+                        fprintf(stderr, "--ignore requires a pattern\n");
+                        free_ignore_patterns(ignore_patterns, ignore_count);
+                        return 1;
+                    }
+                    if(add_ignore_pattern(&ignore_patterns, &ignore_count, argv[i+1]) != 0){
+                        fprintf(stderr, "Failed to store ignore pattern\n");
+                        free_ignore_patterns(ignore_patterns, ignore_count);
+                        return 1;
+                    }
+                    i++;
+                } else if(strncmp(argv[i], "--ignore=", 9) == 0){
+                    if(add_ignore_pattern(&ignore_patterns, &ignore_count, argv[i] + 9) != 0){
+                        fprintf(stderr, "Failed to store ignore pattern\n");
+                        free_ignore_patterns(ignore_patterns, ignore_count);
+                        return 1;
+                    }
+                }
+            }
+
+            for(int i=3;i<argc;i++){
+                if(strcmp(argv[i],"-c")==0) { i++; continue; }
+                if(strcmp(argv[i],"-p")==0) { i++; continue; }
+                if(strcmp(argv[i],"--incremental")==0 || strcmp(argv[i],"--mirror")==0 || strcmp(argv[i],"--i")==0 || strcmp(argv[i],"--m")==0 || strcmp(argv[i],"-i")==0 || strcmp(argv[i],"-m")==0){ continue; }
+                if(strcmp(argv[i],"--quiet")==0 || strcmp(argv[i],"-q")==0){ continue; }
+                if(strcmp(argv[i],"--ignore")==0){ i++; continue; }
+                if(strncmp(argv[i], "--ignore=", 9) == 0){ continue; }
 
             char *arg = argv[i];
             char *level_colon = NULL;
@@ -6355,6 +6483,11 @@ int main(int argc, char **argv){
             free(src_norm);
             if(col){
                 for(int j=0; j<cnt; j++){
+                    const char *candidate_archive = archive_path ? (archive_override ? archive_override : archive_path) : col[j];
+                    if(should_ignore_path(col[j], candidate_archive, ignore_patterns, ignore_count)){
+                        free(col[j]);
+                        continue;
+                    }
                     filepairs = realloc(filepairs, sizeof(filepair_t)*(total+1));
                     levels = realloc(levels, sizeof(int)*(total+1));
                     filepairs[total].src_path = col[j];
@@ -6390,24 +6523,28 @@ int main(int argc, char **argv){
                 fwrite(&index_offset, 8, 1, f);
                 fclose(f);
                 if(!global_quiet) fprintf(stderr, "Created empty archive: %s\n", archive);
+                free_ignore_patterns(ignore_patterns, ignore_count);
                 return 0;
             } else {
                 fprintf(stderr, "Failed to create archive: %s\n", archive);
+                free_ignore_patterns(ignore_patterns, ignore_count);
                 return 1;
             }
         } else {
 
             fclose(f);
             if(!global_quiet) fprintf(stderr, "Archive already exists: %s\n", archive);
+            free_ignore_patterns(ignore_patterns, ignore_count);
             return 0;
         }
     }
-        int res = add_files(archive, filepairs, levels, total, pwd, incremental_mode);
+        int res = add_files(archive, filepairs, levels, total, pwd, incremental_mode, mirror_mode);
         for(int i=0;i<total;i++){
             free(filepairs[i].src_path);
             free(filepairs[i].archive_path);
         }
         free(filepairs); free(levels);
+        free_ignore_patterns(ignore_patterns, ignore_count);
         return res;
     } else if(strcmp(cmd,"l")==0){ return list_archive(archive, json); }
     else if(strcmp(cmd,"search")==0){
