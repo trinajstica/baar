@@ -6,11 +6,12 @@
 
 # Build artifacts
 /*.o
-/*.so
-/*.a
-/*.lo
+ /*.so
+ /*.a
+ /*.lo
+*.o
 baar.o
-la_baar.o
+la_bridge.o
 
 # Temporary and swap files
 *~
