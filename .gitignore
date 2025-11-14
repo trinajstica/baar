@@ -9,6 +9,8 @@
 /*.so
 /*.a
 /*.lo
+baar.o
+la_baar.o
 
 # Temporary and swap files
 *~
