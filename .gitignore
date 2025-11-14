@@ -41,3 +41,6 @@ coverage/
 config.log
 config.status
 .bak_comments/
+
+# Ignore repository memory instruction (local preferences)
+.github/instructions/memory.instruction.md
