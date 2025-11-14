@@ -1,4 +1,4 @@
-#define BAAR_HEADER "BAAR v0.18, \xC2\xA9 BArko, 2025"
+#define BAAR_HEADER "BAAR v0.22, \xC2\xA9 BArko, 2025"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -90,6 +90,9 @@ static void usage(){
         "  baar a <archive> [files...] [-c 0|1|2|3|4] [-p password]\n"
         "    Add files or directories to <archive> (.baar is appended if missing).\n"
         "    Files may be specified as src:dst to control the archive path or src:level to set per-file compression.\n"
+        "    Use --incremental (alias --i) and/or --mirror (alias --m) to mirror provided paths: skip unchanged files and remove entries missing on disk.\n"
+        "      --incremental, --i     Incremental mode: only add new/changed files.\n"
+        "      --mirror, --m         Mirror mode: also mark as deleted files missing from source.\n"
         "\n"
         "  baar x <archive> [dest_dir] [-p password]\n"
         "    Extract all files from <archive> into dest_dir (current dir if omitted).\n"
@@ -195,6 +198,7 @@ static gboolean on_internal_drop_accept(GtkDropTarget *target, GdkDrop *drop, gp
 static gboolean on_internal_drop(GtkDropTarget *target, const GValue *value, double x, double y, gpointer user_data);
 
 static char **collect_files_recursive(const char *path, int *out_count);
+static char *normalize_path_basic(const char *path);
 
 static void on_file_overwrite_response(GtkDialog *dialog, gint response, gpointer user_data);
 
@@ -941,7 +945,7 @@ static void close_archive_gui(void){
 static int write_index(FILE *f, index_t *idx);
 static int update_header_index_offset(FILE *f, uint64_t index_offset);
 static int ensure_header(FILE *f);
-static int add_files(const char *archive, filepair_t *filepairs, int *clevels, int nfiles, const char *pwd);
+static int add_files(const char *archive, filepair_t *filepairs, int *clevels, int nfiles, const char *pwd, int incremental_mode);
 
 
 static void show_progress_dialog(const char *title, const char *message){
@@ -1213,7 +1217,7 @@ static void on_add_files_response(GtkDialog *dialog, int response_id, gpointer d
                 free(file_paths);
             } else {
 
-                add_files(g_current_archive, filepairs, clevels, nfiles, password);
+                add_files(g_current_archive, filepairs, clevels, nfiles, password, 0);
             }
 
             update_progress(0.9, "Refreshing index...");
@@ -3714,7 +3718,7 @@ static gboolean on_drop(GtkDropTarget *target, const GValue *value, double x, do
         free(dir_paths);
 
 
-        if(add_files(g_current_archive, filepairs, clevels, total_files, password_copy) == 0){
+        if(add_files(g_current_archive, filepairs, clevels, total_files, password_copy, 0) == 0){
             update_progress(0.9, "Refreshing index...");
 
 
@@ -4079,7 +4083,7 @@ static void on_drop_create_response(GtkDialog *dialog, gint response, gpointer u
                         }
                         free(dir_paths);
 
-                        if(add_files(final_path, filepairs, clevels, total_files, NULL) == 0){
+                        if(add_files(final_path, filepairs, clevels, total_files, NULL, 0) == 0){
                             update_progress(0.9, "Refreshing index...");
 
                             FILE *rf = fopen(final_path, "rb");
@@ -4720,17 +4724,56 @@ static char *make_name(const char *base, const char *suffix){
 }
 
 
+static char *normalize_path_basic(const char *path){
+    if(!path) return NULL;
+    size_t len = strlen(path);
+    if(len == 0) return NULL;
+    char *out = malloc(len + 1);
+    if(!out) return NULL;
+    size_t oi = 0;
+    int last_slash = 0;
+    for(size_t i=0;i<len;i++){
+        unsigned char c = (unsigned char)path[i];
+        if(c == '/'){
+            if(oi == 0){
+                out[oi++] = '/';
+            } else if(!last_slash){
+                out[oi++] = '/';
+            }
+            last_slash = 1;
+        } else {
+            out[oi++] = (char)c;
+            last_slash = 0;
+        }
+    }
+    while(oi > 1 && out[oi-1] == '/') oi--;
+    out[oi] = '\0';
+    if(oi == 0){
+        free(out);
+        return NULL;
+    }
+    return out;
+}
+
 static char **collect_files_recursive(const char *path, int *out_count){
+    if(out_count) *out_count = 0;
+    if(!path || !path[0]) return NULL;
+
+    char *clean = normalize_path_basic(path);
+    if(!clean) return NULL;
+
     char **list = NULL; int count = 0;
     struct stat st;
-    if(stat(path,&st)!=0) return NULL;
+    if(stat(clean,&st)!=0){ free(clean); return NULL; }
     if(S_ISDIR(st.st_mode)){
-        DIR *d = opendir(path);
-        if(!d) return NULL;
+        DIR *d = opendir(clean);
+        if(!d){ free(clean); return NULL; }
         struct dirent *ent;
         while((ent = readdir(d))){
             if(strcmp(ent->d_name, ".")==0 || strcmp(ent->d_name, "..")==0) continue;
-            char child[4096]; snprintf(child,sizeof(child),"%s/%s", path, ent->d_name);
+            char child[4096];
+            if(clean[0]=='/' && clean[1]=='\0') snprintf(child,sizeof(child),"/%s", ent->d_name);
+            else snprintf(child,sizeof(child),"%s/%s", clean, ent->d_name);
             int child_count = 0;
             char **child_list = collect_files_recursive(child, &child_count);
             if(child_list){
@@ -4742,6 +4785,7 @@ static char **collect_files_recursive(const char *path, int *out_count){
             }
         }
         closedir(d);
+        free(clean);
 
         list = realloc(list, sizeof(char*)*(count+1));
         list[count] = NULL;
@@ -4749,14 +4793,13 @@ static char **collect_files_recursive(const char *path, int *out_count){
         return list;
     } else if(S_ISREG(st.st_mode)){
         list = malloc(sizeof(char*)*2);
-        list[0] = strdup(path);
+        if(!list){ free(clean); return NULL; }
+        list[0] = clean;
         list[1] = NULL;
         if(out_count) *out_count = 1;
         return list;
     }
-    if(out_count) {
-        *out_count = 0;
-    }
+    free(clean);
     return NULL;
 }
 
@@ -5140,140 +5183,468 @@ static int ensure_header(FILE *f){
     return 0;
 }
 
+typedef enum {
+    FILE_PLAN_ADD = 0,
+    FILE_PLAN_SKIP_UNCHANGED,
+    FILE_PLAN_SKIP_ERROR
+} file_plan_action_t;
 
-static int add_files(const char *archive, filepair_t *filepairs, int *clevels, int nfiles, const char *pwd){
+typedef struct {
+    int stat_ok;
+    int readable;
+    int errno_code;
+    int counts_for_desired;
+    struct stat st;
+    file_plan_action_t action;
+    uint32_t existing_id;
+    int existing_valid;
+    uint64_t existing_uncomp;
+    uint64_t existing_mtime;
+    uint32_t existing_mode;
+} file_plan_t;
+
+static int compare_entry_ptr(const void *a, const void *b){
+    const entry_t *ea = *(const entry_t * const *)a;
+    const entry_t *eb = *(const entry_t * const *)b;
+    if(!ea || !eb){
+        return (ea > eb) - (ea < eb);
+    }
+    if(!ea->name && !eb->name) return 0;
+    if(!ea->name) return -1;
+    if(!eb->name) return 1;
+    return strcmp(ea->name, eb->name);
+}
+
+static entry_t *find_entry_by_name(entry_t **arr, size_t count, const char *name){
+    if(!arr || !name) return NULL;
+    size_t lo = 0, hi = count;
+    while(lo < hi){
+        size_t mid = (lo + hi) / 2;
+        entry_t *cur = arr[mid];
+        if(!cur || !cur->name){
+            lo = mid + 1;
+            continue;
+        }
+        int cmp = strcmp(name, cur->name);
+        if(cmp == 0) return cur;
+        if(cmp < 0) hi = mid;
+        else lo = mid + 1;
+    }
+    return NULL;
+}
+
+static int compare_str_ptr(const void *a, const void *b){
+    const char *sa = *(const char * const *)a;
+    const char *sb = *(const char * const *)b;
+    if(!sa && !sb) return 0;
+    if(!sa) return -1;
+    if(!sb) return 1;
+    return strcmp(sa, sb);
+}
+
+static int name_in_desired(char **arr, size_t count, const char *name){
+    if(!arr || !name || count == 0) return 0;
+    size_t lo = 0, hi = count;
+    while(lo < hi){
+        size_t mid = (lo + hi) / 2;
+        const char *cur = arr[mid];
+        if(!cur){
+            lo = mid + 1;
+            continue;
+        }
+        int cmp = strcmp(name, cur);
+        if(cmp == 0) return 1;
+        if(cmp < 0) hi = mid;
+        else lo = mid + 1;
+    }
+    return 0;
+}
+
+static void append_unique_id(uint32_t **arr, uint32_t *count, uint32_t id){
+    if(!arr || !count) return;
+    for(uint32_t i=0;i<*count;i++){
+        if((*arr)[i] == id) return;
+    }
+    uint32_t *tmp = realloc(*arr, sizeof(uint32_t) * (*count + 1));
+    if(!tmp) return;
+    *arr = tmp;
+    (*arr)[*count] = id;
+    (*count)++;
+}
+
+static int add_files(const char *archive, filepair_t *filepairs, int *clevels, int nfiles, const char *pwd, int incremental_mode){
 
     FILE *f = fopen(archive, "r+b");
     if(!f) f = fopen(archive, "w+b");
     if(!f) { perror("open archive"); return 1; }
     ensure_header(f);
     index_t idx = load_index(f);
+    const char *mirror_debug = getenv("BAAR_DEBUG_MIRROR");
 
-    uint32_t *to_remove = NULL; uint32_t remove_count = 0;
-    for(int i=0;i<nfiles;i++){
-        for(uint32_t j=0;j<idx.n;j++){
-            if(idx.entries[j].name && strcmp(idx.entries[j].name, filepairs[i].archive_path)==0 && !(idx.entries[j].flags & 4)){
-                to_remove = realloc(to_remove, sizeof(uint32_t)*(remove_count+1));
-                to_remove[remove_count++] = idx.entries[j].id;
+    entry_t **entry_lookup = NULL;
+    size_t entry_lookup_count = 0;
+    if(idx.n){
+        entry_lookup = malloc(sizeof(entry_t*) * idx.n);
+        if(entry_lookup){
+            for(uint32_t i=0;i<idx.n;i++){
+                if(idx.entries[i].name && !(idx.entries[i].flags & 4)){
+                    entry_lookup[entry_lookup_count++] = &idx.entries[i];
+                }
+            }
+            if(entry_lookup_count){
+                qsort(entry_lookup, entry_lookup_count, sizeof(entry_t*), compare_entry_ptr);
             }
         }
     }
-    if(remove_count>0){
-        fclose(f);
 
-        if(rebuild_archive(archive, to_remove, remove_count, 1)!=0){ free(to_remove); return 1; }
+    file_plan_t *plans = NULL;
+    if(nfiles > 0){
+        plans = calloc(nfiles, sizeof(*plans));
+        if(!plans){
+            fprintf(stderr, "Out of memory while preparing file list.\n");
+            free(entry_lookup);
+            free_index(&idx);
+            fclose(f);
+            return 1;
+        }
+    }
+
+    char **desired_names = NULL;
+    size_t desired_count = 0;
+    int desired_valid = 1;
+
+    if(plans){
+        for(int i=0;i<nfiles;i++){
+            file_plan_t *plan = &plans[i];
+            plan->action = FILE_PLAN_ADD;
+            plan->counts_for_desired = 1;
+            plan->stat_ok = 0;
+            plan->readable = 0;
+            plan->errno_code = 0;
+            plan->existing_id = 0;
+            plan->existing_valid = 0;
+            const char *src = filepairs[i].src_path;
+
+            if(stat(src, &plan->st)==0){
+                plan->stat_ok = 1;
+            } else {
+                plan->errno_code = errno;
+                plan->counts_for_desired = (plan->errno_code == EACCES || plan->errno_code == EPERM) ? 1 : 0;
+                plan->action = FILE_PLAN_SKIP_ERROR;
+            }
+
+            if(plan->stat_ok){
+                FILE *probe = fopen(src, "rb");
+                if(!probe){
+                    plan->errno_code = errno;
+                    plan->action = FILE_PLAN_SKIP_ERROR;
+                } else {
+                    plan->readable = 1;
+                    fclose(probe);
+                }
+            }
+
+            if(filepairs[i].archive_path){
+                entry_t *existing = find_entry_by_name(entry_lookup, entry_lookup_count, filepairs[i].archive_path);
+                if(existing){
+                    plan->existing_id = existing->id;
+                    plan->existing_valid = 1;
+                    plan->existing_uncomp = existing->uncomp_size;
+                    plan->existing_mtime = existing->mtime;
+                    plan->existing_mode = existing->mode;
+                }
+            }
+
+            if(incremental_mode){
+                if(plan->counts_for_desired && filepairs[i].archive_path && desired_valid){
+                    char **tmp = realloc(desired_names, sizeof(char*) * (desired_count + 1));
+                    if(!tmp){
+                        desired_valid = 0;
+                    } else {
+                        desired_names = tmp;
+                        desired_names[desired_count++] = filepairs[i].archive_path;
+                    }
+                }
+
+                if(plan->stat_ok && plan->readable && plan->existing_valid){
+                    if(plan->existing_uncomp == (uint64_t)plan->st.st_size &&
+                       plan->existing_mtime == (uint64_t)plan->st.st_mtime &&
+                       (plan->existing_mode & 07777u) == (uint32_t)(plan->st.st_mode & 07777u)){
+                        plan->action = FILE_PLAN_SKIP_UNCHANGED;
+                    }
+                }
+            }
+
+            if(plan->action == FILE_PLAN_SKIP_ERROR){
+                const char *msg = plan->errno_code ? strerror(plan->errno_code) : "unknown error";
+                fprintf(stderr, "Skipping %s: %s\n", src, msg);
+            }
+
+            if(mirror_debug && incremental_mode){
+                fprintf(stderr, "[BAAR mirror plan] %s action=%d existing=%u stat_ok=%d readable=%d size=%lld/%" PRIu64 " mtime=%lld/%" PRIu64 "\n",
+                        src,
+                        plan->action,
+                        plan->existing_valid ? plan->existing_id : UINT32_MAX,
+                        plan->stat_ok,
+                        plan->readable,
+                        (long long)(plan->stat_ok ? (long long)plan->st.st_size : -1),
+                        plan->existing_uncomp,
+                        (long long)(plan->stat_ok ? (long long)plan->st.st_mtime : -1),
+                        plan->existing_mtime);
+            }
+        }
+    }
+
+    uint32_t *to_remove = NULL;
+    uint32_t remove_count = 0;
+
+    if(incremental_mode && desired_valid){
+        if(desired_count > 1 && desired_names){
+            qsort(desired_names, desired_count, sizeof(char*), compare_str_ptr);
+        }
+        for(uint32_t i=0;i<idx.n;i++){
+            entry_t *e = &idx.entries[i];
+            if(!e->name || (e->flags & 4)) continue;
+            int keep = (desired_names && desired_count > 0) ? name_in_desired(desired_names, desired_count, e->name) : 0;
+            if(!desired_names || desired_count == 0){
+                keep = 0;
+            }
+            if(!keep){
+                append_unique_id(&to_remove, &remove_count, e->id);
+            }
+        }
+    }
+
+    if(plans){
+        for(int i=0;i<nfiles;i++){
+            file_plan_t *plan = &plans[i];
+            if(plan->existing_valid && plan->action == FILE_PLAN_ADD){
+                append_unique_id(&to_remove, &remove_count, plan->existing_id);
+            }
+        }
+    }
+
+    free(entry_lookup);
+    entry_lookup = NULL;
+
+    if(mirror_debug && incremental_mode){
+        fprintf(stderr, "[BAAR mirror] desired=%zu remove=%u valid=%d\n", desired_count, remove_count, desired_valid);
+    }
+
+    if(incremental_mode){
+        if(remove_count > 0 && to_remove){
+            if(!global_quiet){
+                fprintf(stderr, "Mirror: marking %u entries as deleted\n", remove_count);
+            }
+            for(uint32_t i=0;i<remove_count;i++){
+                uint32_t rid = to_remove[i];
+                for(uint32_t j=0;j<idx.n;j++){
+                    if(idx.entries[j].id == rid){
+                        idx.entries[j].flags |= 4;
+                        break;
+                    }
+                }
+            }
+        }
         free(to_remove);
-
+        to_remove = NULL;
+    } else if(remove_count > 0){
+        fclose(f);
+        if(rebuild_archive(archive, to_remove, remove_count, global_quiet) != 0){
+            free(to_remove);
+            free(desired_names);
+            free(plans);
+            free_index(&idx);
+            return 1;
+        }
+        free(to_remove);
+        to_remove = NULL;
         f = fopen(archive, "r+b");
         if(!f) f = fopen(archive, "w+b");
-        if(!f){ perror("reopen archive"); return 1; }
+        if(!f){
+            perror("reopen archive");
+            free(desired_names);
+            free(plans);
+            free_index(&idx);
+            return 1;
+        }
         ensure_header(f);
         free_index(&idx);
         idx = load_index(f);
+    } else {
+        free(to_remove);
     }
 
     fseek(f,0,SEEK_END);
-    for(int i=0;i<nfiles;i++){
-        const char *path = filepairs[i].src_path;
-        const char *archive_path = filepairs[i].archive_path;
-        int clevel = clevels ? clevels[i] : 0;
 
-
-        if(g_progress_dialog && g_progress_bar && g_progress_label){
-            double frac = 0.1 + ((double)i / (double)nfiles) * 0.8;
-            char pbuf[512];
-
-            const char *display_name = strrchr(path, '/');
-            display_name = display_name ? display_name + 1 : path;
-            if(strlen(display_name) > 60){
-                snprintf(pbuf, sizeof(pbuf), "%.57s... (%d/%d)", display_name, i+1, nfiles);
-            } else {
-                snprintf(pbuf, sizeof(pbuf), "%s (%d/%d)", display_name, i+1, nfiles);
+    if(plans){
+        for(int i=0;i<nfiles;i++){
+            file_plan_t *plan = &plans[i];
+            if(plan->action == FILE_PLAN_SKIP_UNCHANGED){
+                if(incremental_mode && !global_quiet){
+                    fprintf(stderr, "Skipping unchanged: %s\n", filepairs[i].src_path);
+                }
+                continue;
             }
-            update_progress(frac, pbuf);
-            while(g_main_context_pending(NULL)) g_main_context_iteration(NULL, FALSE);
-        }
-
-
-        volatile int spinner_run = 1;
-        typedef struct { const char *name; volatile int *run; } spinner_arg_t;
-        spinner_arg_t *sarg = malloc(sizeof(*sarg));
-        sarg->name = path; sarg->run = &spinner_run;
-        pthread_t spinner_thread;
-        int spinner_created = 0;
-        if(pthread_create(&spinner_thread, NULL, spinner_fn, sarg)==0){ spinner_created = 1; }
-        else { free(sarg); sarg = NULL; spinner_created = 0; }
-
-        FILE *in = fopen(path, "rb");
-        if(!in){
-            spinner_run = 0; pthread_join(spinner_thread, NULL); free(sarg);
-            fprintf(stderr,"Cannot open %s: %s\n", path, strerror(errno)); continue; }
-        struct stat st; stat(path,&st);
-        size_t fsize = st.st_size;
-        unsigned char *buf = malloc(fsize);
-        fread(buf,1,fsize,in);
-        fclose(in);
-        uint32_t crc = crc32(0, buf, fsize);
-        unsigned char *out = NULL;
-        size_t out_sz = 0;
-        int compressed = 0;
-        if(clevel>0 && fsize>0){
-            unsigned char *tmpout = NULL; size_t tmpoutsz = 0;
-            if(compress_data_level(clevel, buf, fsize, &tmpout, &tmpoutsz)==0){
-                if(tmpoutsz < fsize){ out = tmpout; out_sz = tmpoutsz; compressed = 1; }
-                else { free(tmpout); out = NULL; }
+            if(plan->action == FILE_PLAN_SKIP_ERROR){
+                continue;
             }
+
+            const char *path = filepairs[i].src_path;
+            const char *archive_path = filepairs[i].archive_path;
+            int clevel = clevels ? clevels[i] : 0;
+
+            if(g_progress_dialog && g_progress_bar && g_progress_label){
+                double frac = 0.1 + ((double)i / (double)nfiles) * 0.8;
+                char pbuf[512];
+                const char *display_name = strrchr(path, '/');
+                display_name = display_name ? display_name + 1 : path;
+                if(strlen(display_name) > 60){
+                    snprintf(pbuf, sizeof(pbuf), "%.57s... (%d/%d)", display_name, i+1, nfiles);
+                } else {
+                    snprintf(pbuf, sizeof(pbuf), "%s (%d/%d)", display_name, i+1, nfiles);
+                }
+                update_progress(frac, pbuf);
+                while(g_main_context_pending(NULL)) g_main_context_iteration(NULL, FALSE);
+            }
+
+            volatile int spinner_run = 1;
+            spinner_arg_t *sarg = malloc(sizeof(*sarg));
+            if(sarg){
+                sarg->name = path;
+                sarg->run = &spinner_run;
+            }
+            pthread_t spinner_thread;
+            int spinner_created = 0;
+            if(sarg && pthread_create(&spinner_thread, NULL, spinner_fn, sarg)==0){
+                spinner_created = 1;
+            } else if(sarg){
+                free(sarg);
+                sarg = NULL;
+            }
+
+            FILE *in = fopen(path, "rb");
+            if(!in){
+                if(spinner_created){ spinner_run = 0; pthread_join(spinner_thread, NULL); }
+                if(sarg) free(sarg);
+                fprintf(stderr, "Cannot open %s: %s\n", path, strerror(errno));
+                continue;
+            }
+
+            size_t fsize = (size_t)plan->st.st_size;
+            unsigned char *buf = NULL;
+            if(fsize > 0){
+                buf = malloc(fsize);
+                if(!buf){
+                    if(spinner_created){ spinner_run = 0; pthread_join(spinner_thread, NULL); }
+                    if(sarg) free(sarg);
+                    fclose(in);
+                    fprintf(stderr, "Warning: not enough memory for %s\n", path);
+                    continue;
+                }
+                size_t readn = fread(buf,1,fsize,in);
+                if(readn != fsize){
+                    if(spinner_created){ spinner_run = 0; pthread_join(spinner_thread, NULL); }
+                    if(sarg) free(sarg);
+                    fprintf(stderr, "Read error for %s: %s\n", path, ferror(in) ? strerror(errno) : "unexpected end of file");
+                    fclose(in);
+                    free(buf);
+                    continue;
+                }
+            }
+            fclose(in);
+
+            const unsigned char *crc_buf = fsize > 0 ? buf : (const unsigned char*)"";
+            uint32_t crc = crc32(0, crc_buf, fsize);
+            unsigned char *out = NULL;
+            size_t out_sz = 0;
+            int compressed = 0;
+            if(clevel>0 && fsize>0 && buf){
+                unsigned char *tmpout = NULL; size_t tmpoutsz = 0;
+                if(compress_data_level(clevel, buf, fsize, &tmpout, &tmpoutsz)==0){
+                    if(tmpoutsz < fsize){ out = tmpout; out_sz = tmpoutsz; compressed = 1; }
+                    else { free(tmpout); tmpout = NULL; }
+                }
+            }
+
+            unsigned char *final = NULL;
+            size_t final_sz = 0;
+            if(compressed){ final = out; final_sz = out_sz; }
+            else { final = buf; final_sz = fsize; }
+
+            unsigned char *enc_buf = NULL;
+            if(final_sz > 0){
+                enc_buf = malloc(final_sz);
+                if(!enc_buf){
+                    if(spinner_created){ spinner_run = 0; pthread_join(spinner_thread, NULL); }
+                    if(sarg) free(sarg);
+                    fprintf(stderr, "Warning: not enough memory while encrypting %s\n", path);
+                    if(out) free(out);
+                    if(buf) free(buf);
+                    continue;
+                }
+                memcpy(enc_buf, final, final_sz);
+                if(pwd && pwd[0]){ xor_buf(enc_buf, final_sz, pwd); }
+            }
+
+            uint64_t data_offset = ftell(f);
+            if(final_sz > 0){
+                fwrite(enc_buf,1,final_sz,f);
+            }
+
+            idx.entries = realloc(idx.entries, sizeof(entry_t)*(idx.n+1));
+            entry_t *e = &idx.entries[idx.n];
+            memset(e,0,sizeof(*e));
+            e->id = idx.next_id++;
+            e->name = strdup(archive_path);
+            e->flags = (compressed?1:0) | ((pwd&&pwd[0])?2:0);
+            e->comp_level = clevel;
+            e->data_offset = data_offset;
+            e->comp_size = final_sz;
+            e->uncomp_size = fsize;
+            e->crc32 = crc;
+            idx.n++;
+
+            e->mode = (uint32_t)(plan->st.st_mode & 07777);
+            e->uid = (uint32_t)plan->st.st_uid;
+            e->gid = (uint32_t)plan->st.st_gid;
+            e->mtime = (uint64_t)plan->st.st_mtime;
+
+            unsigned int percent = 0;
+            if(fsize>0 && final_sz <= fsize){
+                long long diff = (long long)fsize - (long long)final_sz;
+                if(diff < 0) diff = 0;
+                unsigned long long p = (unsigned long long)diff * 100ULL / (unsigned long long)fsize;
+                if(p>100) p = 100;
+                percent = (unsigned int)p;
+            }
+
+            spinner_run = 0;
+            if(spinner_created){ pthread_join(spinner_thread, NULL); }
+            if(sarg) free(sarg);
+            fprintf(stderr, "\r%s ... (%u%%)\n", path, percent);
+
+            if(enc_buf) free(enc_buf);
+            if(out) free(out);
+            if(buf) free(buf);
         }
-        unsigned char *final = NULL;
-        size_t final_sz = 0;
-        if(compressed){ final = out; final_sz = out_sz; }
-        else { final = buf; final_sz = fsize; }
-
-        unsigned char *enc_buf = malloc(final_sz);
-        memcpy(enc_buf, final, final_sz);
-        if(pwd && pwd[0]){ xor_buf(enc_buf, final_sz, pwd); }
-    uint64_t data_offset = ftell(f);
-    fwrite(enc_buf,1,final_sz,f);
-
-
-        idx.entries = realloc(idx.entries, sizeof(entry_t)*(idx.n+1));
-        entry_t *e = &idx.entries[idx.n];
-        memset(e,0,sizeof(*e));
-        e->id = idx.next_id++;
-        e->name = strdup(archive_path);
-        e->flags = (compressed?1:0) | ((pwd&&pwd[0])?2:0);
-        e->comp_level = clevel;
-        e->data_offset = data_offset;
-        e->comp_size = final_sz;
-        e->uncomp_size = fsize;
-        e->crc32 = crc;
-        idx.n++;
-
-        e->mode = (uint32_t)(st.st_mode & 07777);
-        e->uid = (uint32_t)st.st_uid;
-        e->gid = (uint32_t)st.st_gid;
-        e->mtime = (uint64_t)st.st_mtime;
-
-        unsigned int percent = 0;
-        if(fsize>0){
-            long long diff = (long long)fsize - (long long)final_sz;
-            if(diff < 0) diff = 0;
-            unsigned long long p = (unsigned long long)diff * 100ULL / (unsigned long long)fsize;
-            if(p>100) p = 100;
-            percent = (unsigned int)p;
-        }
-    spinner_run = 0;
-    if(spinner_created){ pthread_join(spinner_thread, NULL); if(sarg) free(sarg); }
-        fprintf(stderr, "\r%s ... (%u%%)\n", path, percent);
-    free(enc_buf);
-        if(out) free(out);
-        if(!compressed) free(buf);
     }
 
     uint64_t index_offset = ftell(f);
     write_index(f, &idx);
     update_header_index_offset(f, index_offset);
+    if(incremental_mode && !global_quiet){
+        uint32_t deleted_entries = 0;
+        for(uint32_t i=0;i<idx.n;i++){
+            if(idx.entries[i].flags & 4) deleted_entries++;
+        }
+        if(idx.n > 0 && deleted_entries > idx.n / 2){
+            fprintf(stderr, "Hint: archive contains many deleted entries; run 'baar f %s' to compact.\n", archive);
+        }
+    }
     fclose(f);
+    free(desired_names);
+    free(plans);
     free_index(&idx);
     return 0;
 }
@@ -5852,6 +6223,9 @@ int main(int argc, char **argv){
             } else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
                 compression_level = atoi(argv[i + 1]);
                 i++;
+            } else if (strcmp(argv[i], "--incremental") == 0 || strcmp(argv[i], "--mirror") == 0 || strcmp(argv[i], "--i") == 0 || strcmp(argv[i], "--m") == 0) {
+                fprintf(stderr, "--incremental/--mirror are only available for native BAAR archives.\n");
+                return 1;
             }
         }
 
@@ -5906,13 +6280,14 @@ int main(int argc, char **argv){
     }
     const char *archive = archive_buf;
 
-    int clevel = 1; const char *pwd = NULL; int json = 0;
+    int clevel = 1; const char *pwd = NULL; int json = 0; int incremental_mode = 0;
     for(int i=3;i<argc;i++){
         if(strcmp(argv[i],"-c")==0 && i+1<argc){ clevel = atoi(argv[i+1]); i++; }
         else if(strncmp(argv[i], "-c", 2) == 0 && isdigit((unsigned char)argv[i][2])) { clevel = atoi(argv[i]+2); }
         else if(strcmp(argv[i],"-p")==0 && i+1<argc){ pwd = argv[i+1]; i++; }
         else if(strcmp(argv[i],"--json")==0 || strcmp(argv[i],"-j")==0){ json = 1; }
         else if(strcmp(argv[i],"--quiet")==0 || strcmp(argv[i],"-q")==0){ global_quiet = 1; }
+        else if(strcmp(argv[i],"--incremental")==0 || strcmp(argv[i],"--mirror")==0 || strcmp(argv[i],"--i")==0 || strcmp(argv[i],"--m")==0){ incremental_mode = 1; }
     }
 
     if(!pwd) pwd = getenv("BAAR_PWD");
@@ -5924,6 +6299,8 @@ int main(int argc, char **argv){
         for(int i=3;i<argc;i++){
             if(strcmp(argv[i],"-c")==0) { i++; continue; }
             if(strcmp(argv[i],"-p")==0) { i++; continue; }
+            if(strcmp(argv[i],"--incremental")==0 || strcmp(argv[i],"--mirror")==0){ continue; }
+            if(strcmp(argv[i],"--quiet")==0 || strcmp(argv[i],"-q")==0){ continue; }
 
             char *arg = argv[i];
             char *level_colon = NULL;
@@ -5959,15 +6336,30 @@ int main(int argc, char **argv){
                 src_path = srcbuf;
                 archive_path = dstbuf;
             }
+            char *archive_override = NULL;
+            if(archive_path){
+                archive_override = normalize_path_basic(archive_path);
+                if(!archive_override){
+                    fprintf(stderr, "Invalid archive path mapping: %s\n", archive_path);
+                    continue;
+                }
+            }
+            char *src_norm = normalize_path_basic(src_path);
+            if(!src_norm){
+                fprintf(stderr, "Invalid path: %s\n", src_path);
+                if(archive_override) free(archive_override);
+                continue;
+            }
             int cnt=0;
-            char **col = collect_files_recursive(src_path, &cnt);
+            char **col = collect_files_recursive(src_norm, &cnt);
+            free(src_norm);
             if(col){
                 for(int j=0; j<cnt; j++){
                     filepairs = realloc(filepairs, sizeof(filepair_t)*(total+1));
                     levels = realloc(levels, sizeof(int)*(total+1));
                     filepairs[total].src_path = col[j];
                     if(archive_path){
-                        filepairs[total].archive_path = strdup(archive_path);
+                        filepairs[total].archive_path = archive_override ? strdup(archive_override) : strdup(archive_path);
                     } else {
                         filepairs[total].archive_path = strdup(col[j]);
                     }
@@ -5976,8 +6368,9 @@ int main(int argc, char **argv){
                 }
                 free(col);
             }
+            if(archive_override) free(archive_override);
         }
-    if(total==0){
+    if(total==0 && !incremental_mode){
 
         FILE *f = fopen(archive, "rb");
         if(!f) {
@@ -6009,7 +6402,7 @@ int main(int argc, char **argv){
             return 0;
         }
     }
-        int res = add_files(archive, filepairs, levels, total, pwd);
+        int res = add_files(archive, filepairs, levels, total, pwd, incremental_mode);
         for(int i=0;i<total;i++){
             free(filepairs[i].src_path);
             free(filepairs[i].archive_path);
