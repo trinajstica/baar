@@ -1,4 +1,4 @@
-#define BAAR_HEADER "BAAR v0.22, \xC2\xA9 BArko, 2025"
+#define BAAR_HEADER "BAAR v0.24, \xC2\xA9 BArko, 2025"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,6 +18,8 @@
 #include <fnmatch.h>
 #include <fcntl.h>
 #include <ctype.h>
+#include <limits.h>
+#include <signal.h>
 #include <gtk/gtk.h>
 #include <archive.h>
 #include <archive_entry.h>
@@ -141,6 +143,16 @@ typedef struct {
     char *archive_path;
 } filepair_t;
 
+typedef struct {
+    char *src_root;
+    char *archive_override;
+    int clevel;
+} add_job_t;
+
+static int add_files_streaming(const char *archive, add_job_t *jobs, int job_count,
+                               const char *pwd, int incremental_mode, int mirror_mode,
+                               char **ignore_patterns, size_t ignore_count);
+
 
 
 static GtkWidget *g_main_window = NULL;
@@ -178,6 +190,17 @@ static GtkWidget *g_progress_dialog = NULL;
 static GtkWidget *g_progress_bar = NULL;
 static GtkWidget *g_progress_label = NULL;
 
+static GSList *g_temp_dirs_for_cleanup = NULL;
+static int g_cleanup_registered = 0;
+
+static void cleanup_registered_temp_dirs(void);
+static void register_temp_dir_for_cleanup(const char *path);
+
+static volatile sig_atomic_t g_abort_requested = 0;
+static int g_sig_handlers_installed = 0;
+static struct sigaction g_prev_sigint;
+static struct sigaction g_prev_sigterm;
+
 
 static void on_row_activated(GtkListBox *box, GtkListBoxRow *row, gpointer user_data);
 
@@ -200,6 +223,12 @@ static gboolean on_internal_drop(GtkDropTarget *target, const GValue *value, dou
 
 static char **collect_files_recursive(const char *path, int *out_count);
 static char *normalize_path_basic(const char *path);
+static int make_temp_dir_near_archive(const char *archive_path, const char *tag,
+                                      char *out, size_t out_sz);
+static int prepare_temp_dir_for_archive(const char *archive_path, const char *tag,
+                                         char *out, size_t out_sz, int track_cleanup);
+static void install_cli_signal_handlers(void);
+static void restore_cli_signal_handlers(void);
 
 static void on_file_overwrite_response(GtkDialog *dialog, gint response, gpointer user_data);
 
@@ -2202,14 +2231,17 @@ static void on_row_activated(GtkListBox *box, GtkListBoxRow *row, gpointer user_
 
             if(strcmp(rd->name, "..") == 0) return;
 
-            char temp_dir[512];
-            snprintf(temp_dir, sizeof(temp_dir), "/tmp/baar_%d", (int)getpid());
-            mkdir(temp_dir, 0700);
+            char temp_dir[PATH_MAX];
+            if(prepare_temp_dir_for_archive(g_current_archive, "baar_extract",
+                                            temp_dir, sizeof(temp_dir), 1) != 0){
+                g_warning("Failed to create temporary directory for extraction");
+                return;
+            }
 
 
             const char *base = strrchr(rd->name, '/');
             base = base ? base+1 : rd->name;
-            char out_path[4096];
+            char out_path[PATH_MAX * 2];
             snprintf(out_path, sizeof(out_path), "%s/%s", temp_dir, base);
 
 
@@ -2467,9 +2499,13 @@ static GdkContentProvider* on_drag_prepare(GtkDragSource *source, double x, doub
     }
 
 
-    char temp_dir[512];
-    snprintf(temp_dir, sizeof(temp_dir), "/tmp/baar_drag_%d", getpid());
-    mkdir(temp_dir, 0700);
+    char temp_dir[PATH_MAX];
+    if(prepare_temp_dir_for_archive(g_current_archive, "baar_drag",
+                                    temp_dir, sizeof(temp_dir), 1) != 0){
+        g_warning("Failed to create temporary directory for drag export");
+        g_list_free(selected_rows);
+        return NULL;
+    }
 
 
     int extracted_capacity = num_selected * 10;
@@ -2504,7 +2540,7 @@ static GdkContentProvider* on_drag_prepare(GtkDragSource *source, double x, doub
                 const char *base_folder = last_slash ? (last_slash + 1) : folder_name;
 
 
-                char base_folder_path[1024];
+                char base_folder_path[PATH_MAX * 2];
                 snprintf(base_folder_path, sizeof(base_folder_path), "%s/%s", temp_dir, base_folder);
                 mkdir(base_folder_path, 0755);
 
@@ -2550,7 +2586,7 @@ static GdkContentProvider* on_drag_prepare(GtkDragSource *source, double x, doub
             } else {
 
                 char *base = basename(rd->name);
-                char temp_path[1024];
+                char temp_path[PATH_MAX * 2];
                 snprintf(temp_path, sizeof(temp_path), "%s/%s", temp_dir, base);
 
 
@@ -2644,7 +2680,7 @@ static GdkContentProvider* on_drag_prepare(GtkDragSource *source, double x, doub
             const char *base_folder = last_slash ? (last_slash + 1) : folder_name;
 
 
-            char base_folder_path[1024];
+            char base_folder_path[PATH_MAX * 2];
             snprintf(base_folder_path, sizeof(base_folder_path), "%s/%s", temp_dir, base_folder);
             mkdir(base_folder_path, 0755);
 
@@ -2663,7 +2699,7 @@ static GdkContentProvider* on_drag_prepare(GtkDragSource *source, double x, doub
                     if(relative[strlen(relative)-1] == '/') continue;
 
 
-                    char temp_path[2048];
+                    char temp_path[PATH_MAX * 2];
                     snprintf(temp_path, sizeof(temp_path), "%s/%s/%s", temp_dir, base_folder, relative);
 
 
@@ -2749,7 +2785,7 @@ static GdkContentProvider* on_drag_prepare(GtkDragSource *source, double x, doub
         } else {
 
             char *base = basename(rd->name);
-            char temp_path[1024];
+            char temp_path[PATH_MAX * 2];
             snprintf(temp_path, sizeof(temp_path), "%s/%s", temp_dir, base);
 
 
@@ -4756,6 +4792,150 @@ static char *normalize_path_basic(const char *path){
     return out;
 }
 
+static void remove_path_recursive(const char *path){
+    if(!path || !path[0]) return;
+    struct stat st;
+    if(lstat(path, &st) != 0){
+        return;
+    }
+    if(S_ISDIR(st.st_mode)){
+        DIR *dir = opendir(path);
+        if(dir){
+            struct dirent *ent;
+            while((ent = readdir(dir))){
+                if(strcmp(ent->d_name, ".")==0 || strcmp(ent->d_name, "..") == 0) continue;
+                char child[PATH_MAX * 2];
+                snprintf(child, sizeof(child), "%s/%s", path, ent->d_name);
+                remove_path_recursive(child);
+            }
+            closedir(dir);
+        }
+        rmdir(path);
+    } else {
+        unlink(path);
+    }
+}
+
+static void cleanup_registered_temp_dirs(void){
+    GSList *iter = g_temp_dirs_for_cleanup;
+    while(iter){
+        char *dir = iter->data;
+        if(dir){
+            remove_path_recursive(dir);
+            free(dir);
+        }
+        iter = iter->next;
+    }
+    g_slist_free(g_temp_dirs_for_cleanup);
+    g_temp_dirs_for_cleanup = NULL;
+}
+
+static void register_temp_dir_for_cleanup(const char *path){
+    if(!path || !path[0]) return;
+    char *dup = strdup(path);
+    if(!dup) return;
+    g_temp_dirs_for_cleanup = g_slist_prepend(g_temp_dirs_for_cleanup, dup);
+    if(!g_cleanup_registered){
+        atexit(cleanup_registered_temp_dirs);
+        g_cleanup_registered = 1;
+    }
+}
+
+static int make_temp_dir_near_archive(const char *archive_path, const char *tag,
+                                      char *out, size_t out_sz){
+    if(!archive_path || !tag || !out || out_sz == 0) return -1;
+    char base[PATH_MAX];
+    const char *slash = strrchr(archive_path, '/');
+    if(slash){
+        size_t dir_len = (size_t)(slash - archive_path);
+        if(dir_len == 0){
+            strcpy(base, "/");
+        } else {
+            if(dir_len >= sizeof(base)) dir_len = sizeof(base) - 1;
+            memcpy(base, archive_path, dir_len);
+            base[dir_len] = '\0';
+        }
+    } else {
+        strcpy(base, ".");
+    }
+
+    int pid = (int)getpid();
+    for(int attempt = 0; attempt < 100; attempt++){
+        if(strcmp(base, "/") == 0){
+            snprintf(out, out_sz, "/.%s_%d_%02d", tag, pid, attempt);
+        } else {
+            snprintf(out, out_sz, "%s/.%s_%d_%02d", base, tag, pid, attempt);
+        }
+        if(mkdir(out, 0700) == 0){
+            return 0;
+        }
+        if(errno == EEXIST){
+            continue;
+        }
+        if(errno == EROFS || errno == EACCES || errno == EPERM || errno == ENOENT){
+            return 1; // signal fallback to /tmp
+        }
+    }
+    return 1;
+}
+
+static int prepare_temp_dir_for_archive(const char *archive_path, const char *tag,
+                                         char *out, size_t out_sz, int track_cleanup){
+    int res = make_temp_dir_near_archive(archive_path, tag, out, out_sz);
+    if(res == 0){
+        if(track_cleanup) register_temp_dir_for_cleanup(out);
+        return 0;
+    }
+    int pid = (int)getpid();
+    for(int attempt = 0; attempt < 100; attempt++){
+        snprintf(out, out_sz, "/tmp/%s_%d_%02d", tag, pid, attempt);
+        if(mkdir(out, 0700) == 0){
+            if(track_cleanup) register_temp_dir_for_cleanup(out);
+            return 0;
+        }
+        if(errno == EEXIST){
+            continue;
+        }
+    }
+    return -1;
+}
+
+static void baar_signal_handler(int sig){
+    (void)sig;
+    g_abort_requested = 1;
+}
+
+static void install_cli_signal_handlers(void){
+    if(g_sig_handlers_installed) return;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = baar_signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    struct sigaction oldint, oldterm;
+    if(sigaction(SIGINT, &sa, &oldint) == 0){
+        g_prev_sigint = oldint;
+    } else {
+        memset(&g_prev_sigint, 0, sizeof(g_prev_sigint));
+        g_prev_sigint.sa_handler = SIG_DFL;
+    }
+    if(sigaction(SIGTERM, &sa, &oldterm) == 0){
+        g_prev_sigterm = oldterm;
+    } else {
+        memset(&g_prev_sigterm, 0, sizeof(g_prev_sigterm));
+        g_prev_sigterm.sa_handler = SIG_DFL;
+    }
+    g_sig_handlers_installed = 1;
+}
+
+static void restore_cli_signal_handlers(void){
+    if(!g_sig_handlers_installed) return;
+    sigaction(SIGINT, &g_prev_sigint, NULL);
+    sigaction(SIGTERM, &g_prev_sigterm, NULL);
+    g_sig_handlers_installed = 0;
+    g_abort_requested = 0;
+}
+
 static char **collect_files_recursive(const char *path, int *out_count){
     if(out_count) *out_count = 0;
     if(!path || !path[0]) return NULL;
@@ -4803,6 +4983,161 @@ static char **collect_files_recursive(const char *path, int *out_count){
     free(clean);
     return NULL;
 }
+
+typedef struct {
+    char **items;
+    size_t count;
+    size_t capacity;
+} path_stack_t;
+
+static void path_stack_free(path_stack_t *stack){
+    if(!stack) return;
+    for(size_t i=0;i<stack->count;i++){
+        free(stack->items[i]);
+    }
+    free(stack->items);
+    stack->items = NULL;
+    stack->count = 0;
+    stack->capacity = 0;
+}
+
+static int path_stack_push(path_stack_t *stack, const char *path){
+    if(!stack || !path) return -1;
+    char *dup = strdup(path);
+    if(!dup) return -1;
+    if(stack->count == stack->capacity){
+        size_t newcap = stack->capacity ? stack->capacity * 2 : 64;
+        char **tmp = realloc(stack->items, sizeof(char*) * newcap);
+        if(!tmp){
+            free(dup);
+            return -1;
+        }
+        stack->items = tmp;
+        stack->capacity = newcap;
+    }
+    stack->items[stack->count++] = dup;
+    return 0;
+}
+
+static char *path_stack_pop(path_stack_t *stack){
+    if(!stack || stack->count == 0) return NULL;
+    return stack->items[--stack->count];
+}
+
+typedef struct {
+    const char *name;
+    uint32_t index;
+} entry_lookup_item_t;
+
+static int compare_lookup_items(const void *a, const void *b){
+    const entry_lookup_item_t *ea = a;
+    const entry_lookup_item_t *eb = b;
+    if(!ea->name && !eb->name) return 0;
+    if(!ea->name) return -1;
+    if(!eb->name) return 1;
+    return strcmp(ea->name, eb->name);
+}
+
+static entry_lookup_item_t *build_entry_lookup_items(index_t *idx, size_t *out_count){
+    if(out_count) *out_count = 0;
+    if(!idx || idx->n == 0) return NULL;
+    entry_lookup_item_t *items = malloc(sizeof(*items) * idx->n);
+    if(!items) return NULL;
+    size_t count = 0;
+    for(uint32_t i=0;i<idx->n;i++){
+        entry_t *e = &idx->entries[i];
+        if(!e->name || (e->flags & 4)) continue;
+        items[count].name = e->name;
+        items[count].index = i;
+        count++;
+    }
+    if(count > 1){
+        qsort(items, count, sizeof(*items), compare_lookup_items);
+    }
+    if(out_count) *out_count = count;
+    return items;
+}
+
+static entry_t *find_entry_by_name_fast(entry_lookup_item_t *items, size_t count, index_t *idx, const char *name){
+    if(!items || !idx || !name || count == 0) return NULL;
+    size_t lo = 0, hi = count;
+    while(lo < hi){
+        size_t mid = (lo + hi) / 2;
+        const char *cur = items[mid].name;
+        if(!cur){
+            lo = mid + 1;
+            continue;
+        }
+        int cmp = strcmp(name, cur);
+        if(cmp == 0){
+            uint32_t idx_pos = items[mid].index;
+            if(idx_pos < idx->n){
+                return &idx->entries[idx_pos];
+            }
+            return NULL;
+        }
+        if(cmp < 0) hi = mid;
+        else lo = mid + 1;
+    }
+    return NULL;
+}
+
+typedef struct {
+    FILE *archive_fp;
+    index_t *idx;
+    size_t original_entry_count;
+    entry_lookup_item_t *entry_lookup;
+    size_t entry_lookup_count;
+    uint8_t *entry_seen;
+    uint32_t **to_remove;
+    uint32_t *remove_count;
+    const char *pwd;
+    int incremental_mode;
+    int mirror_mode;
+    char **ignore_patterns;
+    size_t ignore_count;
+} add_stream_ctx_t;
+
+static char *build_child_path(const char *parent, const char *name){
+    if(!parent || !name) return NULL;
+    size_t pl = strlen(parent);
+    size_t nl = strlen(name);
+    size_t extra = 2; // slash + nul
+    if(pl > 0 && parent[pl-1] == '/') extra--;
+    char *out = malloc(pl + nl + extra);
+    if(!out) return NULL;
+    if(pl == 1 && parent[0] == '/'){
+        snprintf(out, pl + nl + extra, "/%s", name);
+    } else if(pl > 0 && parent[pl-1] == '/'){
+        snprintf(out, pl + nl + extra, "%s%s", parent, name);
+    } else {
+        snprintf(out, pl + nl + extra, "%s/%s", parent, name);
+    }
+    return out;
+}
+
+static char *resolve_archive_path(const add_job_t *job, const char *src_path){
+    if(!job || !src_path) return NULL;
+    if(job->archive_override){
+        return strdup(job->archive_override);
+    }
+    return normalize_path_basic(src_path);
+}
+
+static void mark_entry_deleted_flag(index_t *idx, uint32_t id){
+    if(!idx) return;
+    for(uint32_t i=0;i<idx->n;i++){
+        if(idx->entries[i].id == id){
+            idx->entries[i].flags |= 4;
+            break;
+        }
+    }
+}
+
+static int process_single_file(add_stream_ctx_t *ctx,
+                               const char *src_path, const char *archive_path,
+                               int clevel, const struct stat *st);
+static int walk_job_tree(add_stream_ctx_t *ctx, const add_job_t *job);
 
 static int add_ignore_pattern(char ***patterns, size_t *count, const char *pattern){
     if(!patterns || !count || !pattern || !pattern[0]) return -1;
@@ -5707,6 +6042,469 @@ static int add_files(const char *archive, filepair_t *filepairs, int *clevels, i
     return 0;
 }
 
+static int process_single_file(add_stream_ctx_t *ctx,
+                               const char *src_path, const char *archive_path,
+                               int clevel, const struct stat *st){
+    if(!ctx || !ctx->idx || !ctx->archive_fp || !src_path || !archive_path || !st){
+        return 1;
+    }
+    if(g_abort_requested) return 1;
+    if(clevel < 0) clevel = 0;
+    if(clevel > 3) clevel = 3;
+
+    entry_t *existing = find_entry_by_name_fast(ctx->entry_lookup, ctx->entry_lookup_count,
+                                                ctx->idx, archive_path);
+    if(existing){
+        size_t existing_idx = (size_t)(existing - ctx->idx->entries);
+        if(ctx->entry_seen && existing_idx < ctx->original_entry_count){
+            ctx->entry_seen[existing_idx] = 1;
+        }
+        if(ctx->incremental_mode){
+            if(existing->uncomp_size == (uint64_t)st->st_size &&
+               existing->mtime == (uint64_t)st->st_mtime &&
+               (existing->mode & 07777u) == (uint32_t)(st->st_mode & 07777u)){
+                if(!global_quiet){
+                    fprintf(stderr, "Skipping unchanged: %s\n", src_path);
+                }
+                return 0;
+            }
+        }
+        append_unique_id(ctx->to_remove, ctx->remove_count, existing->id);
+        if(ctx->incremental_mode){
+            mark_entry_deleted_flag(ctx->idx, existing->id);
+        }
+    }
+
+    uint64_t file_sz64 = (uint64_t)st->st_size;
+    if(file_sz64 > SIZE_MAX){
+        fprintf(stderr, "Skipping %s: file too large for buffer\n", src_path);
+        return 1;
+    }
+    size_t fsize = (size_t)file_sz64;
+
+    volatile int spinner_run = 1;
+    spinner_arg_t *sarg = malloc(sizeof(*sarg));
+    pthread_t spinner_thread;
+    int spinner_created = 0;
+    if(sarg){
+        sarg->name = src_path;
+        sarg->run = &spinner_run;
+        if(pthread_create(&spinner_thread, NULL, spinner_fn, sarg)==0){
+            spinner_created = 1;
+        } else {
+            free(sarg);
+            sarg = NULL;
+        }
+    }
+
+    FILE *in = fopen(src_path, "rb");
+    if(!in){
+        if(spinner_created){ spinner_run = 0; pthread_join(spinner_thread, NULL); }
+        if(sarg) free(sarg);
+        fprintf(stderr, "Cannot open %s: %s\n", src_path, strerror(errno));
+        return 1;
+    }
+
+    unsigned char *buf = NULL;
+    if(fsize > 0){
+        buf = malloc(fsize);
+        if(!buf){
+            if(spinner_created){ spinner_run = 0; pthread_join(spinner_thread, NULL); }
+            if(sarg) free(sarg);
+            fclose(in);
+            fprintf(stderr, "Warning: not enough memory for %s\n", src_path);
+            return 1;
+        }
+        size_t readn = fread(buf,1,fsize,in);
+        if(readn != fsize){
+            if(spinner_created){ spinner_run = 0; pthread_join(spinner_thread, NULL); }
+            if(sarg) free(sarg);
+            fprintf(stderr, "Read error for %s: %s\n", src_path,
+                    ferror(in) ? strerror(errno) : "unexpected end of file");
+            fclose(in);
+            free(buf);
+            return 1;
+        }
+    }
+    fclose(in);
+
+    const unsigned char *crc_buf = (buf && fsize > 0) ? buf : (const unsigned char*)"";
+    uint32_t crc = crc32(0, crc_buf, fsize);
+
+    unsigned char *out = NULL;
+    size_t out_sz = 0;
+    int compressed = 0;
+    if(clevel > 0 && fsize > 0 && buf){
+        unsigned char *tmpout = NULL; size_t tmpoutsz = 0;
+        if(compress_data_level(clevel, buf, fsize, &tmpout, &tmpoutsz)==0){
+            if(tmpoutsz < fsize){
+                out = tmpout;
+                out_sz = tmpoutsz;
+                compressed = 1;
+            } else {
+                free(tmpout);
+            }
+        }
+    }
+
+    unsigned char *final = buf;
+    size_t final_sz = fsize;
+    if(out){
+        final = out;
+        final_sz = out_sz;
+    }
+
+    unsigned char *enc_buf = NULL;
+    if(final_sz > 0){
+        enc_buf = malloc(final_sz);
+        if(!enc_buf){
+            if(spinner_created){ spinner_run = 0; pthread_join(spinner_thread, NULL); }
+            if(sarg) free(sarg);
+            fprintf(stderr, "Warning: not enough memory while encrypting %s\n", src_path);
+            if(out) free(out);
+            if(buf) free(buf);
+            return 1;
+        }
+        memcpy(enc_buf, final, final_sz);
+        if(ctx->pwd && ctx->pwd[0]){
+            xor_buf(enc_buf, final_sz, ctx->pwd);
+        }
+    }
+
+    char *archive_name = strdup(archive_path);
+    if(!archive_name){
+        if(spinner_created){ spinner_run = 0; pthread_join(spinner_thread, NULL); }
+        if(sarg) free(sarg);
+        fprintf(stderr, "Out of memory while tracking %s\n", archive_path);
+        if(enc_buf) free(enc_buf);
+        if(out) free(out);
+        if(buf) free(buf);
+        return 1;
+    }
+
+    entry_t *tmp_entries = realloc(ctx->idx->entries, sizeof(entry_t) * (ctx->idx->n + 1));
+    if(!tmp_entries){
+        if(spinner_created){ spinner_run = 0; pthread_join(spinner_thread, NULL); }
+        if(sarg) free(sarg);
+        fprintf(stderr, "Out of memory while expanding index\n");
+        free(archive_name);
+        if(enc_buf) free(enc_buf);
+        if(out) free(out);
+        if(buf) free(buf);
+        return 1;
+    }
+    ctx->idx->entries = tmp_entries;
+    entry_t *e = &ctx->idx->entries[ctx->idx->n];
+    memset(e,0,sizeof(*e));
+    e->id = ctx->idx->next_id++;
+    e->name = archive_name;
+    e->flags = (compressed ? 1 : 0) | ((ctx->pwd && ctx->pwd[0]) ? 2 : 0);
+    e->comp_level = clevel;
+
+    fseek(ctx->archive_fp, 0, SEEK_END);
+    uint64_t data_offset = ftell(ctx->archive_fp);
+    if(final_sz > 0){
+        size_t written = fwrite(enc_buf,1,final_sz,ctx->archive_fp);
+        if(written != final_sz){
+            fprintf(stderr, "Write error while adding %s\n", src_path);
+            ctx->idx->next_id--;
+            free(e->name);
+            e->name = NULL;
+            if(enc_buf) free(enc_buf);
+            if(out) free(out);
+            if(buf) free(buf);
+            if(spinner_created){ spinner_run = 0; pthread_join(spinner_thread, NULL); }
+            if(sarg) free(sarg);
+            return 1;
+        }
+    }
+
+    e->data_offset = data_offset;
+    e->comp_size = final_sz;
+    e->uncomp_size = fsize;
+    e->crc32 = crc;
+    e->mode = (uint32_t)(st->st_mode & 07777u);
+    e->uid = (uint32_t)st->st_uid;
+    e->gid = (uint32_t)st->st_gid;
+    e->mtime = (uint64_t)st->st_mtime;
+    ctx->idx->n++;
+
+    spinner_run = 0;
+    if(spinner_created){ pthread_join(spinner_thread, NULL); }
+    if(sarg) free(sarg);
+
+    unsigned int percent = 0;
+    if(fsize > 0 && final_sz <= fsize){
+        long long diff = (long long)fsize - (long long)final_sz;
+        if(diff < 0) diff = 0;
+        unsigned long long p = (unsigned long long)diff * 100ULL / (unsigned long long)fsize;
+        if(p > 100) p = 100;
+        percent = (unsigned int)p;
+    }
+    fprintf(stderr, "\r%s ... (%u%%)\n", src_path, percent);
+
+    if(enc_buf) free(enc_buf);
+    if(out) free(out);
+    if(buf) free(buf);
+    return 0;
+}
+
+static int walk_job_tree(add_stream_ctx_t *ctx, const add_job_t *job){
+    if(!ctx || !job || !job->src_root) return 0;
+
+    char *root_archive = resolve_archive_path(job, job->src_root);
+    if(root_archive){
+        if(should_ignore_path(job->src_root, root_archive, ctx->ignore_patterns, ctx->ignore_count)){
+            free(root_archive);
+            return 0;
+        }
+        free(root_archive);
+    }
+
+    path_stack_t stack = {0};
+    if(path_stack_push(&stack, job->src_root) != 0){
+        fprintf(stderr, "Out of memory while scheduling %s\n", job->src_root);
+        path_stack_free(&stack);
+        return 1;
+    }
+
+    int status = 0;
+    while(stack.count){
+        if(g_abort_requested){
+            status = 1;
+            break;
+        }
+        char *current = path_stack_pop(&stack);
+        if(!current) break;
+        struct stat st;
+        if(stat(current, &st)!=0){
+            fprintf(stderr, "Skipping %s: %s\n", current, strerror(errno));
+            free(current);
+            continue;
+        }
+
+        if(S_ISDIR(st.st_mode)){
+            DIR *dir = opendir(current);
+            if(!dir){
+                fprintf(stderr, "Cannot open directory %s: %s\n", current, strerror(errno));
+                free(current);
+                continue;
+            }
+            struct dirent *ent;
+            while((ent = readdir(dir))){
+                if(g_abort_requested){
+                    status = 1;
+                    break;
+                }
+                if(strcmp(ent->d_name, ".")==0 || strcmp(ent->d_name, "..") == 0) continue;
+                char *child = build_child_path(current, ent->d_name);
+                if(!child){
+                    fprintf(stderr, "Out of memory while expanding %s/%s\n", current, ent->d_name);
+                    status = 1;
+                    continue;
+                }
+                if(g_abort_requested){
+                    free(child);
+                    status = 1;
+                    break;
+                }
+                struct stat child_st;
+                if(stat(child, &child_st)!=0){
+                    fprintf(stderr, "Skipping %s: %s\n", child, strerror(errno));
+                    free(child);
+                    continue;
+                }
+                if(S_ISDIR(child_st.st_mode)){
+                    char *dir_archive = resolve_archive_path(job, child);
+                    int skip_dir = dir_archive ? should_ignore_path(child, dir_archive, ctx->ignore_patterns, ctx->ignore_count)
+                                               : should_ignore_path(child, child, ctx->ignore_patterns, ctx->ignore_count);
+                    if(dir_archive) free(dir_archive);
+                    if(skip_dir){
+                        free(child);
+                        continue;
+                    }
+                    if(path_stack_push(&stack, child)!=0){
+                        fprintf(stderr, "Out of memory while scheduling %s\n", child);
+                        free(child);
+                        status = 1;
+                        continue;
+                    }
+                    free(child);
+                    continue;
+                }
+                if(S_ISREG(child_st.st_mode)){
+                    if(g_abort_requested){
+                        free(child);
+                        status = 1;
+                        break;
+                    }
+                    char *archive_path = resolve_archive_path(job, child);
+                    if(!archive_path){
+                        fprintf(stderr, "Out of memory while preparing %s\n", child);
+                        free(child);
+                        status = 1;
+                        continue;
+                    }
+                    if(!should_ignore_path(child, archive_path, ctx->ignore_patterns, ctx->ignore_count)){
+                        if(process_single_file(ctx, child, archive_path, job->clevel, &child_st) != 0){
+                            status = 1;
+                            free(archive_path);
+                            free(child);
+                            break;
+                        }
+                    }
+                    free(archive_path);
+                    free(child);
+                    continue;
+                }
+                free(child);
+            }
+            if(g_abort_requested){
+                closedir(dir);
+                free(current);
+                break;
+            }
+            closedir(dir);
+        } else if(S_ISREG(st.st_mode)){
+            if(g_abort_requested){
+                free(current);
+                status = 1;
+                break;
+            }
+            char *archive_path = resolve_archive_path(job, current);
+            if(archive_path){
+                if(!should_ignore_path(current, archive_path, ctx->ignore_patterns, ctx->ignore_count)){
+                    if(process_single_file(ctx, current, archive_path, job->clevel, &st) != 0){
+                        status = 1;
+                        free(archive_path);
+                        free(current);
+                        break;
+                    }
+                }
+                free(archive_path);
+            }
+        }
+        free(current);
+    }
+
+    if(g_abort_requested){
+        status = 1;
+    }
+    path_stack_free(&stack);
+    return status;
+}
+
+static int add_files_streaming(const char *archive, add_job_t *jobs, int job_count,
+                               const char *pwd, int incremental_mode, int mirror_mode,
+                               char **ignore_patterns, size_t ignore_count){
+    FILE *f = fopen(archive, "r+b");
+    if(!f) f = fopen(archive, "w+b");
+    if(!f){ perror("open archive"); return 1; }
+    ensure_header(f);
+    index_t idx = load_index(f);
+    size_t original_entries = idx.n;
+
+    size_t lookup_count = 0;
+    entry_lookup_item_t *lookup = build_entry_lookup_items(&idx, &lookup_count);
+
+    uint8_t *entry_seen = NULL;
+    int mirror_tracking_ok = 1;
+    if(mirror_mode && original_entries > 0){
+        entry_seen = calloc(original_entries, 1);
+        if(!entry_seen){
+            mirror_tracking_ok = 0;
+            if(!global_quiet){
+                fprintf(stderr, "Warning: mirror tracking disabled due to low memory; skipped deletions.\n");
+            }
+        }
+    }
+
+    uint32_t *to_remove = NULL;
+    uint32_t remove_count = 0;
+
+    add_stream_ctx_t ctx = {
+        .archive_fp = f,
+        .idx = &idx,
+        .original_entry_count = original_entries,
+        .entry_lookup = lookup,
+        .entry_lookup_count = lookup_count,
+        .entry_seen = entry_seen,
+        .to_remove = &to_remove,
+        .remove_count = &remove_count,
+        .pwd = pwd,
+        .incremental_mode = incremental_mode,
+        .mirror_mode = mirror_mode,
+        .ignore_patterns = ignore_patterns,
+        .ignore_count = ignore_count
+    };
+
+    int overall_status = 0;
+    for(int i=0;i<job_count;i++){
+        if(g_abort_requested) break;
+        if(!jobs[i].src_root) continue;
+        if(walk_job_tree(&ctx, &jobs[i]) != 0){
+            overall_status = 1;
+            if(g_abort_requested) break;
+        }
+    }
+
+    if(mirror_mode && mirror_tracking_ok && original_entries > 0){
+        for(size_t i=0;i<original_entries;i++){
+            entry_t *e = &idx.entries[i];
+            if(!e->name || (e->flags & 4)) continue;
+            if(entry_seen && entry_seen[i]) continue;
+            append_unique_id(&to_remove, &remove_count, e->id);
+            if(incremental_mode){
+                e->flags |= 4;
+            }
+        }
+    }
+
+    if(incremental_mode && remove_count > 0 && to_remove){
+        if(!global_quiet && mirror_mode){
+            fprintf(stderr, "Mirror: marking %u entries as deleted\n", remove_count);
+        }
+        for(uint32_t i=0;i<remove_count;i++){
+            mark_entry_deleted_flag(&idx, to_remove[i]);
+        }
+    }
+
+    if(g_abort_requested && !global_quiet){
+        fprintf(stderr, "\nInterrupt received. Finalizing archive metadata...\n");
+    }
+
+    fseek(f,0,SEEK_END);
+    uint64_t index_offset = ftell(f);
+    write_index(f, &idx);
+    update_header_index_offset(f, index_offset);
+    if(incremental_mode && !global_quiet){
+        uint32_t deleted_entries = 0;
+        for(uint32_t i=0;i<idx.n;i++){
+            if(idx.entries[i].flags & 4) deleted_entries++;
+        }
+        if(idx.n > 0 && deleted_entries > idx.n / 2){
+            fprintf(stderr, "Hint: archive contains many deleted entries; run 'baar f %s' to compact.\n", archive);
+        }
+    }
+    fclose(f);
+
+    free(lookup);
+    free(entry_seen);
+
+    int rebuild_status = 0;
+    if(!incremental_mode && remove_count > 0 && to_remove){
+        rebuild_status = rebuild_archive(archive, to_remove, remove_count, global_quiet);
+    }
+
+    free(to_remove);
+    free_index(&idx);
+    if(rebuild_status != 0) overall_status = 1;
+    if(g_abort_requested){
+        return overall_status == 0 ? 130 : overall_status;
+    }
+    return overall_status;
+}
+
 
 static char *escape_json_string(const char *s){
     if(!s) return strdup("");
@@ -6394,9 +7192,8 @@ int main(int argc, char **argv){
     if(!pwd) pwd = getenv("BAAR_PWD");
     if(strcmp(cmd,"a")==0){
 
-            filepair_t *filepairs = NULL;
-            int *levels = NULL;
-            int total = 0;
+            add_job_t *jobs = NULL;
+            int job_count = 0;
             char **ignore_patterns = NULL;
             size_t ignore_count = 0;
 
@@ -6430,80 +7227,67 @@ int main(int argc, char **argv){
                 if(strcmp(argv[i],"--ignore")==0){ i++; continue; }
                 if(strncmp(argv[i], "--ignore=", 9) == 0){ continue; }
 
-            char *arg = argv[i];
-            char *level_colon = NULL;
-            char *dst_colon = NULL;
+                char *arg = argv[i];
+                char *level_colon = NULL;
+                char *dst_colon = NULL;
 
-            char *last_colon = strrchr(arg, ':');
-            int file_level = clevel;
-            char srcbuf[4096], dstbuf[4096];
-            if(last_colon && last_colon > arg && *(last_colon+1) >= '0' && *(last_colon+1) <= '9' && strlen(last_colon+1) <= 2) {
-
-                level_colon = last_colon;
-            } else if(last_colon) {
-                dst_colon = last_colon;
-            }
-            if(level_colon){
-                int lvl = atoi(level_colon+1);
-                if(lvl<0) lvl = 0;
-                if(lvl>3) lvl = 3;
-                file_level = lvl;
-                size_t len = level_colon - arg;
-                strncpy(srcbuf, arg, len);
-                srcbuf[len]=0;
-                arg = srcbuf;
-            }
-            char *src_path = arg;
-            char *archive_path = NULL;
-            if(dst_colon){
-                size_t src_len = dst_colon - arg;
-                strncpy(srcbuf, arg, src_len);
-                srcbuf[src_len]=0;
-                strncpy(dstbuf, dst_colon+1, sizeof(dstbuf)-1);
-                dstbuf[sizeof(dstbuf)-1]=0;
-                src_path = srcbuf;
-                archive_path = dstbuf;
-            }
-            char *archive_override = NULL;
-            if(archive_path){
-                archive_override = normalize_path_basic(archive_path);
-                if(!archive_override){
-                    fprintf(stderr, "Invalid archive path mapping: %s\n", archive_path);
+                char *last_colon = strrchr(arg, ':');
+                int file_level = clevel;
+                char srcbuf[4096], dstbuf[4096];
+                if(last_colon && last_colon > arg && *(last_colon+1) >= '0' && *(last_colon+1) <= '9' && strlen(last_colon+1) <= 2) {
+                    level_colon = last_colon;
+                } else if(last_colon) {
+                    dst_colon = last_colon;
+                }
+                if(level_colon){
+                    int lvl = atoi(level_colon+1);
+                    if(lvl<0) lvl = 0;
+                    if(lvl>3) lvl = 3;
+                    file_level = lvl;
+                    size_t len = level_colon - arg;
+                    strncpy(srcbuf, arg, len);
+                    srcbuf[len]=0;
+                    arg = srcbuf;
+                }
+                char *src_path = arg;
+                char *archive_path = NULL;
+                if(dst_colon){
+                    size_t src_len = dst_colon - arg;
+                    strncpy(srcbuf, arg, src_len);
+                    srcbuf[src_len]=0;
+                    strncpy(dstbuf, dst_colon+1, sizeof(dstbuf)-1);
+                    dstbuf[sizeof(dstbuf)-1]=0;
+                    src_path = srcbuf;
+                    archive_path = dstbuf;
+                }
+                char *src_norm = normalize_path_basic(src_path);
+                if(!src_norm){
+                    fprintf(stderr, "Invalid path: %s\n", src_path);
                     continue;
                 }
-            }
-            char *src_norm = normalize_path_basic(src_path);
-            if(!src_norm){
-                fprintf(stderr, "Invalid path: %s\n", src_path);
-                if(archive_override) free(archive_override);
-                continue;
-            }
-            int cnt=0;
-            char **col = collect_files_recursive(src_norm, &cnt);
-            free(src_norm);
-            if(col){
-                for(int j=0; j<cnt; j++){
-                    const char *candidate_archive = archive_path ? (archive_override ? archive_override : archive_path) : col[j];
-                    if(should_ignore_path(col[j], candidate_archive, ignore_patterns, ignore_count)){
-                        free(col[j]);
+                char *archive_override = NULL;
+                if(archive_path){
+                    archive_override = normalize_path_basic(archive_path);
+                    if(!archive_override){
+                        fprintf(stderr, "Invalid archive path mapping: %s\n", archive_path);
+                        free(src_norm);
                         continue;
                     }
-                    filepairs = realloc(filepairs, sizeof(filepair_t)*(total+1));
-                    levels = realloc(levels, sizeof(int)*(total+1));
-                    filepairs[total].src_path = col[j];
-                    if(archive_path){
-                        filepairs[total].archive_path = archive_override ? strdup(archive_override) : strdup(archive_path);
-                    } else {
-                        filepairs[total].archive_path = strdup(col[j]);
-                    }
-                    levels[total] = file_level;
-                    total++;
                 }
-                free(col);
+                add_job_t *tmp = realloc(jobs, sizeof(add_job_t) * (job_count + 1));
+                if(!tmp){
+                    fprintf(stderr, "Out of memory while queuing sources.\n");
+                    free(src_norm);
+                    if(archive_override) free(archive_override);
+                    continue;
+                }
+                jobs = tmp;
+                jobs[job_count].src_root = src_norm;
+                jobs[job_count].archive_override = archive_override;
+                jobs[job_count].clevel = file_level;
+                job_count++;
             }
-            if(archive_override) free(archive_override);
-        }
-    if(total==0 && !incremental_mode){
+    if(job_count==0 && !incremental_mode){
 
         FILE *f = fopen(archive, "rb");
         if(!f) {
@@ -6537,13 +7321,26 @@ int main(int argc, char **argv){
             free_ignore_patterns(ignore_patterns, ignore_count);
             return 0;
         }
-    }
-        int res = add_files(archive, filepairs, levels, total, pwd, incremental_mode, mirror_mode);
-        for(int i=0;i<total;i++){
-            free(filepairs[i].src_path);
-            free(filepairs[i].archive_path);
+        for(int j=0;j<job_count;j++){
+            free(jobs[j].src_root);
+            if(jobs[j].archive_override) free(jobs[j].archive_override);
         }
-        free(filepairs); free(levels);
+        free(jobs);
+        free_ignore_patterns(ignore_patterns, ignore_count);
+        return 0;
+    }
+        if(job_count > 0){
+            install_cli_signal_handlers();
+        }
+        int res = add_files_streaming(archive, jobs, job_count, pwd, incremental_mode, mirror_mode, ignore_patterns, ignore_count);
+        if(job_count > 0){
+            restore_cli_signal_handlers();
+        }
+        for(int j=0;j<job_count;j++){
+            free(jobs[j].src_root);
+            if(jobs[j].archive_override) free(jobs[j].archive_override);
+        }
+        free(jobs);
         free_ignore_patterns(ignore_patterns, ignore_count);
         return res;
     } else if(strcmp(cmd,"l")==0){ return list_archive(archive, json); }

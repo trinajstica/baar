@@ -24,6 +24,8 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/wait.h>
+#include <limits.h>
+#include <ctype.h>
 #include <archive.h>
 #include <archive_entry.h>
 
@@ -37,6 +39,75 @@ static void fmt_size(uint64_t n, char *out, size_t outlen) {
         ui++;
     }
     snprintf(out, outlen, "%.2f %s", v, units[ui]);
+}
+
+static void sanitize_temp_component(const char *input, char *out, size_t out_sz) {
+    if (!out || out_sz == 0) return;
+    size_t oi = 0;
+    if (!input) input = "archive";
+    for (size_t i = 0; input[i] && oi + 1 < out_sz; i++) {
+        unsigned char c = (unsigned char)input[i];
+        if (c == '/') c = '_';
+        if (!isalnum(c) && c != '-' && c != '_' && c != '.') {
+            c = '_';
+        }
+        out[oi++] = (char)c;
+    }
+    if (oi == 0 && out_sz > 1) {
+        out[oi++] = 'a';
+    }
+    out[oi] = '\0';
+}
+
+static int try_temp_file_in_dir(const char *dir, const char *base, const char *tag,
+                                char *out, size_t out_sz) {
+    if (!dir || !dir[0] || !base || !tag || !out || out_sz == 0) return -1;
+    if (access(dir, W_OK | X_OK) != 0) {
+        return -1;
+    }
+    int pid = (int)getpid();
+    for (int attempt = 0; attempt < 200; attempt++) {
+        if (strcmp(dir, "/") == 0) {
+            snprintf(out, out_sz, "/.%s_%s_%d_%02d", tag, base, pid, attempt);
+        } else {
+            snprintf(out, out_sz, "%s/.%s_%s_%d_%02d", dir, tag, base, pid, attempt);
+        }
+        if (access(out, F_OK) != 0) {
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static int make_temp_file_path_near_archive(const char *archive_path, const char *tag,
+                                            char *out, size_t out_sz) {
+    if (!archive_path || !tag || !out || out_sz == 0) return -1;
+    char dir[PATH_MAX];
+    const char *slash = strrchr(archive_path, '/');
+    if (slash) {
+        size_t len = (size_t)(slash - archive_path);
+        if (len == 0) {
+            strcpy(dir, "/");
+        } else {
+            if (len >= sizeof(dir)) len = sizeof(dir) - 1;
+            memcpy(dir, archive_path, len);
+            dir[len] = '\0';
+        }
+    } else {
+        strcpy(dir, ".");
+    }
+
+    const char *base = slash ? slash + 1 : archive_path;
+    char safe_base[64];
+    sanitize_temp_component(base, safe_base, sizeof(safe_base));
+
+    if (try_temp_file_in_dir(dir, safe_base, tag, out, out_sz) == 0) {
+        return 0;
+    }
+    if (try_temp_file_in_dir("/tmp", safe_base, tag, out, out_sz) == 0) {
+        return 0;
+    }
+    return -1;
 }
 
 
@@ -526,12 +597,11 @@ int la_add_files(const char *archive_path, const char **file_paths,
     }
 
 
-    char temp_path[1024];
-
-
-    const char *base = strrchr(archive_path, '/');
-    base = base ? base + 1 : archive_path;
-    snprintf(temp_path, sizeof(temp_path), "/tmp/.tmp_%s.%d", base, getpid());
+    char temp_path[PATH_MAX];
+    if (make_temp_file_path_near_archive(archive_path, "tmp", temp_path, sizeof(temp_path)) != 0) {
+        fprintf(stderr, "Error: unable to create temporary path for archive %s\n", archive_path);
+        return 1;
+    }
 
     struct archive *out = archive_write_new();
 
@@ -631,6 +701,7 @@ int la_add_files(const char *archive_path, const char **file_paths,
     if (r != ARCHIVE_OK) {
         fprintf(stderr, "Error creating archive: %s\n", archive_error_string(out));
         archive_write_free(out);
+        unlink(temp_path);
         return 1;
     }
 
