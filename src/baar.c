@@ -209,6 +209,38 @@ typedef struct {
     uint32_t crc32;
 } row_data_t;
 
+typedef struct {
+    entry_t *entry;
+    char *path;
+} folder_view_t;
+
+static int folder_view_exists(folder_view_t *views, int count, const char *path){
+    if(!views || !path) return 0;
+    for(int i = 0; i < count; i++){
+        if(views[i].path && strcmp(views[i].path, path) == 0){
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void folder_view_add(folder_view_t **views, int *count, entry_t *entry, const char *path){
+    if(!views || !count || !path) return;
+    char *dup = strdup(path);
+    if(!dup) return;
+
+    folder_view_t *tmp = realloc(*views, sizeof(folder_view_t) * (*count + 1));
+    if(!tmp){
+        free(dup);
+        return;
+    }
+
+    *views = tmp;
+    (*views)[*count].entry = entry;
+    (*views)[*count].path = dup;
+    (*count)++;
+}
+
 
 typedef struct {
     char *src_name;
@@ -332,14 +364,10 @@ static void populate_list_from_index(void){
     }
 
 
-    entry_t **folders_to_show = NULL;
+    folder_view_t *folders_to_show = NULL;
     int folder_count = 0;
     entry_t **files_to_show = NULL;
     int file_count = 0;
-
-
-    char **added_folder_paths = NULL;
-    int added_folder_count = 0;
 
     for(uint32_t i=0;i<g_current_index.n;i++){
         entry_t *e = &g_current_index.entries[i];
@@ -364,11 +392,9 @@ static void populate_list_from_index(void){
 
                 if(slash_pos == display_part + display_len - 1){
 
-                    folders_to_show = realloc(folders_to_show, sizeof(entry_t*) * (folder_count + 1));
-                    folders_to_show[folder_count++] = e;
-
-                    added_folder_paths = realloc(added_folder_paths, sizeof(char*) * (added_folder_count + 1));
-                    added_folder_paths[added_folder_count++] = strdup(e->name);
+                    if(!folder_view_exists(folders_to_show, folder_count, e->name)){
+                        folder_view_add(&folders_to_show, &folder_count, e, e->name);
+                    }
                     continue;
                 }
             }
@@ -387,22 +413,10 @@ static void populate_list_from_index(void){
                 }
 
 
-                int already_added = 0;
-                for(int j = 0; j < added_folder_count; j++){
-                    if(strcmp(added_folder_paths[j], folder_path) == 0){
-                        already_added = 1;
-                        break;
-                    }
-                }
-
-                if(!already_added){
+                if(!folder_view_exists(folders_to_show, folder_count, folder_path)){
 
                     printf("DEBUG: Adding virtual folder for path '%s' (from entry '%s')\n", folder_path, e->name);
-                    folders_to_show = realloc(folders_to_show, sizeof(entry_t*) * (folder_count + 1));
-                    folders_to_show[folder_count++] = e;
-
-                    added_folder_paths = realloc(added_folder_paths, sizeof(char*) * (added_folder_count + 1));
-                    added_folder_paths[added_folder_count++] = strdup(folder_path);
+                    folder_view_add(&folders_to_show, &folder_count, e, folder_path);
                 }
             } else {
 
@@ -417,63 +431,82 @@ static void populate_list_from_index(void){
         if(plen>0){
             if(strncmp(e->name, g_current_prefix, plen)!=0) continue;
             const char *rest = e->name + plen;
-
             size_t restlen = strlen(rest);
-
             if(restlen == 0) continue;
-            if(restlen > 0 && rest[restlen-1] == '/'){
 
+            if(rest[restlen-1] == '/'){
                 if(strchr(rest, '/') != rest + restlen - 1) continue;
-            } else {
-
-                if(strchr(rest, '/')) continue;
+                if(!folder_view_exists(folders_to_show, folder_count, e->name)){
+                    folder_view_add(&folders_to_show, &folder_count, e, e->name);
+                }
+                continue;
             }
-        } else {
 
-            size_t namelen = strlen(e->name);
-            if(namelen > 0 && e->name[namelen-1] == '/'){
-
-                if(strchr(e->name, '/') != e->name + namelen - 1) continue;
-            } else {
-
-                if(strchr(e->name, '/')) continue;
+            const char *next_slash = strchr(rest, '/');
+            if(next_slash){
+                size_t folder_len = next_slash - rest;
+                char folder_path[4096];
+                if(plen > 0){
+                    snprintf(folder_path, sizeof(folder_path), "%s%.*s/", g_current_prefix, (int)folder_len, rest);
+                } else {
+                    snprintf(folder_path, sizeof(folder_path), "%.*s/", (int)folder_len, rest);
+                }
+                if(!folder_view_exists(folders_to_show, folder_count, folder_path)){
+                    folder_view_add(&folders_to_show, &folder_count, e, folder_path);
+                }
+                continue;
             }
-        }
-
-
-        size_t ename_len = strlen(e->name);
-        if(ename_len > 0 && e->name[ename_len-1] == '/'){
-
-            folders_to_show = realloc(folders_to_show, sizeof(entry_t*) * (folder_count + 1));
-            folders_to_show[folder_count++] = e;
-        } else {
 
             files_to_show = realloc(files_to_show, sizeof(entry_t*) * (file_count + 1));
             files_to_show[file_count++] = e;
+            continue;
         }
+
+        size_t namelen = strlen(e->name);
+        if(namelen == 0) continue;
+
+        if(e->name[namelen-1] == '/'){
+            if(strchr(e->name, '/') != e->name + namelen - 1) continue;
+            if(!folder_view_exists(folders_to_show, folder_count, e->name)){
+                folder_view_add(&folders_to_show, &folder_count, e, e->name);
+            }
+            continue;
+        }
+
+        const char *next_slash = strchr(e->name, '/');
+        if(next_slash){
+            size_t folder_len = next_slash - e->name;
+            char folder_path[4096];
+            snprintf(folder_path, sizeof(folder_path), "%.*s/", (int)folder_len, e->name);
+            if(!folder_view_exists(folders_to_show, folder_count, folder_path)){
+                folder_view_add(&folders_to_show, &folder_count, e, folder_path);
+            }
+            continue;
+        }
+
+        files_to_show = realloc(files_to_show, sizeof(entry_t*) * (file_count + 1));
+        files_to_show[file_count++] = e;
     }
 
 
     for(int pass = 0; pass < 2; pass++){
-        entry_t **entries = (pass == 0) ? folders_to_show : files_to_show;
         int count = (pass == 0) ? folder_count : file_count;
 
         for(int idx = 0; idx < count; idx++){
-            entry_t *e = entries[idx];
+            entry_t *e = (pass == 0) ? folders_to_show[idx].entry : files_to_show[idx];
+            if(!e || !e->name) continue;
+
             size_t ename_len = strlen(e->name);
+            const char *effective_path = (pass == 0) ? (folders_to_show[idx].path ? folders_to_show[idx].path : e->name) : e->name;
 
-
-            const char *display_name = e->name + plen;
-            char display_buf[4096];
-            if(g_current_is_libarchive && pass == 0){
-
-                const char *next_slash = strchr(display_name, '/');
-                if(next_slash){
-
-                    size_t folder_len = next_slash - display_name;
-                    snprintf(display_buf, sizeof(display_buf), "%.*s/", (int)folder_len, display_name);
-                    display_name = display_buf;
-                }
+            const char *display_name = effective_path;
+            if(pass == 0 && plen > 0 && strncmp(effective_path, g_current_prefix, plen) == 0){
+                display_name = effective_path + plen;
+                if(!display_name[0]) display_name = effective_path;
+            }
+            if(pass == 1){
+                display_name = e->name + plen;
+                if(!display_name || !display_name[0]) display_name = e->name;
             }
 
 
@@ -504,19 +537,14 @@ static void populate_list_from_index(void){
 
             GtkWidget *lbl_size = NULL;
 
-            int is_folder = (g_current_is_libarchive && pass == 0) || (ename_len > 0 && e->name[ename_len-1] == '/');
+            int is_folder = (pass == 0) || (ename_len > 0 && e->name[ename_len-1] == '/');
             if(is_folder){
 
             uint32_t child_count = 0;
 
             char folder_path_for_count[4096];
-            if(g_current_is_libarchive && pass == 0){
-
-                if(plen > 0){
-                    snprintf(folder_path_for_count, sizeof(folder_path_for_count), "%s%s", g_current_prefix, display_name);
-                } else {
-                    snprintf(folder_path_for_count, sizeof(folder_path_for_count), "%s", display_name);
-                }
+            if(pass == 0){
+                snprintf(folder_path_for_count, sizeof(folder_path_for_count), "%s", effective_path);
             } else {
                 snprintf(folder_path_for_count, sizeof(folder_path_for_count), "%s", e->name);
             }
@@ -587,16 +615,8 @@ static void populate_list_from_index(void){
         row_data_t *rd = malloc(sizeof(row_data_t));
         rd->id = e->id;
 
-
-        if(g_current_is_libarchive && pass == 0 && display_name[strlen(display_name)-1] == '/'){
-
-            char full_folder_path[4096];
-            if(plen > 0){
-                snprintf(full_folder_path, sizeof(full_folder_path), "%s%s", g_current_prefix, display_name);
-            } else {
-                snprintf(full_folder_path, sizeof(full_folder_path), "%s", display_name);
-            }
-            rd->name = strdup(full_folder_path);
+        if(pass == 0){
+            rd->name = strdup(effective_path);
         } else {
             rd->name = strdup(e->name);
         }
@@ -620,11 +640,13 @@ static void populate_list_from_index(void){
 
         if(!g_current_is_libarchive){
 
-            if(ename_len > 0 && e->name[ename_len-1] == '/'){
+            const char *drop_path = (pass == 0) ? effective_path : e->name;
+            size_t drop_len = drop_path ? strlen(drop_path) : 0;
+            if(drop_path && drop_len > 0 && drop_path[drop_len-1] == '/'){
 
                 GtkDropTarget *drop_target = gtk_drop_target_new(G_TYPE_BYTES, GDK_ACTION_MOVE | GDK_ACTION_COPY);
                 gtk_drop_target_set_preload(drop_target, TRUE);
-                char *folder_path = strdup(e->name);
+                char *folder_path = strdup(drop_path);
                 g_signal_connect(drop_target, "accept", G_CALLBACK(on_internal_drop_accept), folder_path);
                 g_signal_connect(drop_target, "drop", G_CALLBACK(on_internal_drop), folder_path);
                 gtk_widget_add_controller(row, GTK_EVENT_CONTROLLER(drop_target));
@@ -638,13 +660,13 @@ static void populate_list_from_index(void){
     }
 
 
-    if(folders_to_show) free(folders_to_show);
-    if(files_to_show) free(files_to_show);
-
-    for(int i = 0; i < added_folder_count; i++){
-        free(added_folder_paths[i]);
+    if(folders_to_show){
+        for(int i = 0; i < folder_count; i++){
+            if(folders_to_show[i].path) free(folders_to_show[i].path);
+        }
+        free(folders_to_show);
     }
-    if(added_folder_paths) free(added_folder_paths);
+    if(files_to_show) free(files_to_show);
 }
 
 
