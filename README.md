@@ -3,9 +3,9 @@
     <img src="main.png" alt="main window">
 </p>
 
-Experimental project — use at your own risk.
+Experimental project - use at your own risk.
 
-Note: Significant portions of this project were generated and iteratively developed with assistance from AI under the direction and guidance of the repository owner. The owner reviewed, tested, and approved the code and design decisions. This project remains experimental — use at your own risk.
+Note: Significant portions of this project were generated and iteratively developed with assistance from AI under the direction and guidance of the repository owner. The owner reviewed, tested, and approved the code and design decisions. This project remains experimental - use at your own risk.
 
 BAAR is a lightweight archiver implemented in C. The primary interface is a command-line (CLI) tool with an optional GTK4-based GUI frontend. The CLI is feature-complete and is the authoritative interface for scripting and automation; the GUI offers an interactive view with drag & drop, browsing, and common archive operations.
 
@@ -92,45 +92,45 @@ The GUI is an optional frontend implemented with GTK4. It provides an interactiv
 
 High-level GUI features and user interactions:
 
-- Window and main layout:
-    - When no archive is open, the GUI shows a simple welcome screen and toolbar with a `+` (open/create) button. When an archive is opened the main pane shows a list of entries (a `GtkListBox`) and an information panel on the right with selected-entry details (name, size, number of entries).
+    - Window and main layout:
+        - When no archive is open, the GUI shows a simple welcome screen and toolbar with a `+` (open/create) button. When an archive is opened the main pane shows a list of entries (a `GtkListBox`) and an information panel on the right with selected-entry details (name, size, number of entries).
 
-- Opening/creating archives:
-    - Use the `+` control to open an existing archive file or to create a new `.baar` archive. If a user drops a `.baar` file onto the window when no archive is open, the GUI will open that archive.
+    - Opening/creating archives:
+        - Use the `+` control to open an existing archive file or to create a new `.baar` archive. If a user drops a `.baar` file onto the window when no archive is open, the GUI will open that archive.
 
-- Browsing and navigation:
-    - The archive view supports folder-style navigation. Virtual folders are provided for libarchive formats (ZIP/TAR) where explicit directory entries may be missing; double-clicking a folder drills down and a `..` parent row is shown to go up one level. The current folder prefix is tracked internally and the list is populated by filtering the loaded index.
+    - Browsing and navigation:
+        - The archive view supports folder-style navigation. Virtual folders are provided for libarchive formats (ZIP/TAR) where explicit directory entries may be missing; double-clicking a folder drills down and a `..` parent row is shown to go up one level. The current folder prefix is tracked internally and the list is populated by filtering the loaded index.
 
-- Adding files and directories:
-    - With an archive open, click the add (`+`) button in the toolbar to add files or directories. Files may also be dropped onto the open archive window to add them.
-    - The GUI supports recursive collection of files when adding directories.
+    - Adding files and directories:
+        - With an archive open, click the add (`+`) button in the toolbar to add files or directories. Files may also be dropped onto the open archive window to add them.
+        - The GUI supports recursive collection of files when adding directories.
 
-- Removing entries and compacting:
-    - Select entries and click the `-` button to mark them as deleted. Deleted entries remain in the archive until a rebuild/compact operation (`Compact` / `Refresh`) is invoked; `Compact` will rebuild the archive excluding deleted entries.
+    - Removing entries and compacting:
+        - Select entries and click the `-` button to mark them as deleted. Deleted entries remain in the archive until a rebuild/compact operation (`Compact` / `Refresh`) is invoked; `Compact` will rebuild the archive excluding deleted entries.
 
-- Extracting files:
-    - Select one or more entries and click the extract/save icon. The GUI will extract the selected entries to a destination chosen by the user. When dragging files out to the file manager (external drag), files are temporarily extracted to a per-process temporary directory such as `/tmp/baar_drag_<pid>/` and provided to the desktop as regular files for the drag operation.
+    - Extracting files:
+        - Select one or more entries and click the extract/save icon. The GUI will extract the selected entries to a destination chosen by the user. When dragging files out to the file manager (external drag), files are temporarily extracted to a per-process temporary directory such as `/tmp/baar_drag_<pid>/` and provided to the desktop as regular files for the drag operation.
 
-- Drag & drop behavior (bidirectional):
-    - Drag IN (into BAAR):
-        - Dropping a `.baar` archive onto the application when no archive is open will open that archive.
-        - Dropping files onto an already-open archive will add those files to the current archive (the user may be prompted for overwrite behavior if conflicts occur).
-        - Dropping files when no archive is open will prompt the user to create a new archive and then add the files.
+    - Drag & drop behavior (bidirectional):
+        - Drag IN (into BAAR):
+            - Dropping a `.baar` archive onto the application when no archive is open will open that archive.
+            - Dropping files onto an already-open archive will add those files to the current archive (the user may be prompted for overwrite behavior if conflicts occur).
+            - Dropping files when no archive is open will prompt the user to create a new archive and then add the files.
 
     - Drag OUT (from BAAR to file manager):
         - Dragging file rows from the archive view to an external file manager causes temporary extraction of the selected entries into a `/tmp/baar_drag_<pid>/` folder and supplies those files to the drag operation. Only file entries are supported for external drag; folders are not provided as a single droppable item.
 
-- Internal drag & drop and moving entries:
-    - The GUI implements internal drag & drop targets for moving items between folders inside BAAR (for the native `.baar` format). Internal moves are performed without extracting full file contents to the filesystem.
+    - Internal drag & drop and moving entries:
+        - The GUI implements internal drag & drop targets for moving items between folders inside BAAR (for the native `.baar` format). Internal moves are performed without extracting full file contents to the filesystem.
 
-- Encryption and password handling in the GUI:
-    - If an archive is encrypted or the user provides a `-p` password via the CLI when opening the GUI, the GUI stores a password in memory for operations that require decryption/encryption. When adding files to an encrypted archive the GUI will encrypt them with the current archive password. On certain drag operations the user may be asked whether to encrypt dropped data.
+    - Encryption and password handling in the GUI:
+        - If an archive is encrypted or the user provides a `-p` password via the CLI when opening the GUI, the GUI stores a password in memory for operations that require decryption/encryption. When adding files to an encrypted archive the GUI will encrypt them with the current archive password. On certain drag operations the user may be asked whether to encrypt dropped data.
 
-- Progress reporting and dialogs:
-    - Long-running operations (add, extract, rebuild) display a progress dialog with a progress bar and descriptive text. Operations are run asynchronously so the UI remains responsive.
+    - Progress reporting and dialogs:
+        - Long-running operations (add, extract, rebuild) display a progress dialog with a progress bar and descriptive text. Operations are run asynchronously so the UI remains responsive.
 
-- Entry metadata and info panel:
-    - Selecting a row shows metadata like uncompressed size, compressed size, CRC, compression level, and POSIX-like attributes (mode, uid, gid, mtime) in the info panel.
+    - Entry metadata and info panel:
+        - Selecting a row shows metadata like uncompressed size, compressed size, CRC, compression level, and POSIX-like attributes (mode, uid, gid, mtime) in the info panel.
 
 ## Building and installation
 
@@ -268,9 +268,9 @@ or for GUI:
 ```sh
 ./baar --gui
 ```
-   - Metadata (permissions, modification time) is preserved
-   - Only files can be dragged out (folders are not supported)
-   - Encrypted archives are not supported for drag-out
+    - Metadata (permissions, modification time) is preserved
+    - Only files can be dragged out (folders are not supported)
+    - Encrypted archives are not supported for drag-out
 
 Notes:
 
