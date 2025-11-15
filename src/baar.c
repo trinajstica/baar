@@ -5988,35 +5988,38 @@ static int add_files(const char *archive, filepair_t *filepairs, int *clevels, i
                 while(g_main_context_pending(NULL)) g_main_context_iteration(NULL, FALSE);
             }
 
-            volatile int spinner_run = 1;
-            spinner_arg_t *sarg = malloc(sizeof(*sarg));
-            const char *spinner_name = path;
-            const char *spinner_base = strrchr(path, '/');
-            if(spinner_base) spinner_name = spinner_base + 1;
-            if(sarg){
-                sarg->name = spinner_name;
-                sarg->run = &spinner_run;
-            }
-            pthread_t spinner_thread;
-            int spinner_created = 0;
-            if(sarg && !global_quiet && pthread_create(&spinner_thread, NULL, spinner_fn, sarg)==0){
-                spinner_created = 1;
-            } else if(sarg){
-                free(sarg);
-                sarg = NULL;
-            }
-
             size_t fsize = (size_t)plan->st.st_size;
+            int streaming_mode = (fsize > BAAR_STREAM_THRESHOLD);
             unsigned char *buf = NULL;
             unsigned char *out = NULL;
             size_t final_sz = 0;
             uint32_t crc = 0;
             int compressed = 0;
-            int streaming_mode = (fsize > BAAR_STREAM_THRESHOLD);
             if(!streaming_mode && fsize > 0){
                 buf = malloc(fsize);
                 if(!buf){
                     streaming_mode = 1;
+                }
+            }
+
+            volatile int spinner_run = 1;
+            spinner_arg_t *sarg = NULL;
+            const char *spinner_name = path;
+            const char *spinner_base = strrchr(path, '/');
+            if(spinner_base) spinner_name = spinner_base + 1;
+            pthread_t spinner_thread;
+            int spinner_created = 0;
+            if(streaming_mode && !global_quiet){
+                sarg = malloc(sizeof(*sarg));
+                if(sarg){
+                    sarg->name = spinner_name;
+                    sarg->run = &spinner_run;
+                    if(pthread_create(&spinner_thread, NULL, spinner_fn, sarg)==0){
+                        spinner_created = 1;
+                    } else {
+                        free(sarg);
+                        sarg = NULL;
+                    }
                 }
             }
 
@@ -6168,30 +6171,39 @@ static int process_single_file(add_stream_ctx_t *ctx,
     }
     size_t fsize = (size_t)file_sz64;
 
-    volatile int spinner_run = 1;
-    spinner_arg_t *sarg = malloc(sizeof(*sarg));
-    const char *spinner_name = src_path;
-    const char *spinner_base = strrchr(src_path, '/');
-    if(spinner_base) spinner_name = spinner_base + 1;
-    pthread_t spinner_thread;
-    int spinner_created = 0;
-    if(sarg){
-        sarg->name = spinner_name;
-        sarg->run = &spinner_run;
-        if(!global_quiet && pthread_create(&spinner_thread, NULL, spinner_fn, sarg)==0){
-            spinner_created = 1;
-        } else {
-            free(sarg);
-            sarg = NULL;
-        }
-    }
-
+    int streaming_mode = (fsize > BAAR_STREAM_THRESHOLD);
     unsigned char *buf = NULL;
     unsigned char *out = NULL;
     size_t final_sz = 0;
     uint32_t crc = 0;
     int compressed = 0;
-    int streaming_mode = (fsize > BAAR_STREAM_THRESHOLD);
+    if(!streaming_mode && fsize > 0){
+        buf = malloc(fsize);
+        if(!buf){
+            streaming_mode = 1;
+        }
+    }
+
+    volatile int spinner_run = 1;
+    spinner_arg_t *sarg = NULL;
+    const char *spinner_name = src_path;
+    const char *spinner_base = strrchr(src_path, '/');
+    if(spinner_base) spinner_name = spinner_base + 1;
+    pthread_t spinner_thread;
+    int spinner_created = 0;
+    if(streaming_mode && !global_quiet){
+        sarg = malloc(sizeof(*sarg));
+        if(sarg){
+            sarg->name = spinner_name;
+            sarg->run = &spinner_run;
+            if(pthread_create(&spinner_thread, NULL, spinner_fn, sarg)==0){
+                spinner_created = 1;
+            } else {
+                free(sarg);
+                sarg = NULL;
+            }
+        }
+    }
 
     char *archive_name = strdup(archive_path);
     if(!archive_name){
@@ -6241,15 +6253,6 @@ static int process_single_file(add_stream_ctx_t *ctx,
                 fprintf(stderr, "Cannot open %s: %s\n", src_path, strerror(errno));
                 if(out) free(out);
                 if(buf) free(buf);
-                return 1;
-            }
-            buf = malloc(fsize);
-            if(!buf){
-                if(spinner_created){ spinner_run = 0; pthread_join(spinner_thread, NULL); }
-                if(sarg) free(sarg);
-                fclose(in);
-                fprintf(stderr, "Warning: not enough memory for %s\n", src_path);
-                if(out) free(out);
                 return 1;
             }
             size_t readn = fread(buf,1,fsize,in);
