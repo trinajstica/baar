@@ -29,6 +29,7 @@
 #include <ctype.h>
 #include <archive.h>
 #include <archive_entry.h>
+#include <libgen.h>
 
 
 static void fmt_size(uint64_t n, char *out, size_t outlen) {
@@ -40,6 +41,19 @@ static void fmt_size(uint64_t n, char *out, size_t outlen) {
         ui++;
     }
     snprintf(out, outlen, "%.2f %s", v, units[ui]);
+}
+
+static const char *compact_basename(const char *path, char *buf, size_t buflen){
+    if(!path){ if(buflen>0) buf[0] = '\0'; return buf; }
+    size_t n = strlen(path);
+    while(n>0 && path[n-1] == '/') n--;
+    size_t start = 0;
+    for(size_t i=0;i<n;i++) if(path[i] == '/') start = i+1;
+    size_t len = n > start ? n - start : 0;
+    if(len >= buflen) len = buflen - 1;
+    if(len) memcpy(buf, path + start, len);
+    buf[len] = '\0';
+    return buf;
 }
 
 static const char* strip_leading_slashes(const char *s) {
@@ -332,7 +346,12 @@ int la_extract(const char *archive_path, const char *dest_dir, const char *passw
                 fprintf(stderr, "Error reading %s: %s\n", name, archive_error_string(a));
                 errors++;
             } else {
-                printf("  %s\n", strip_leading_slashes(name) ? strip_leading_slashes(name) : "");
+                {
+                    const char *tname = strip_leading_slashes(name) ? strip_leading_slashes(name) : name;
+                    char bn[PATH_MAX];
+                    compact_basename(tname, bn, sizeof(bn));
+                    printf("  %s\n", bn);
+                }
                 extracted++;
             }
         }
@@ -366,6 +385,7 @@ int la_extract_single(const char *archive_path, const char *entry_name,
     }
 
     int flags = ARCHIVE_EXTRACT_TIME | ARCHIVE_EXTRACT_PERM;
+    if(geteuid() == 0) flags |= ARCHIVE_EXTRACT_OWNER;
     archive_write_disk_set_options(ext, flags);
     archive_write_disk_set_standard_lookup(ext);
 
@@ -422,7 +442,12 @@ int la_extract_single(const char *archive_path, const char *entry_name,
                     archive_write_free(ext);
                     return 1;
                 }
-                printf("Extracted: %s\n", strip_leading_slashes(name) ? strip_leading_slashes(name) : "");
+                {
+                    const char *tname = strip_leading_slashes(name) ? strip_leading_slashes(name) : name;
+                    char bn[PATH_MAX];
+                    compact_basename(tname, bn, sizeof(bn));
+                    printf("Extracted: %s\n", bn);
+                }
             }
 
             archive_write_finish_entry(ext);
@@ -818,7 +843,13 @@ int la_add_files(const char *archive_path, const char **file_paths,
 
             close(fd);
             if (verbose) fprintf(stderr, "  Added: %s\n", file_path);
-            else { fprintf(stderr, "\rAdding %d files: %s", file_count, file_path); fflush(stderr); }
+            else {
+                const char *base_name = strrchr(file_path, '/');
+                base_name = base_name ? base_name + 1 : file_path;
+                unsigned int perc = (unsigned int)((i + 1) * 100 / (file_count > 0 ? file_count : 1));
+                fprintf(stderr, "\rAdding %d files: %s (%u%%)\x1b[K", file_count, base_name, perc);
+                fflush(stderr);
+            }
         }
 
         archive_entry_free(entry);

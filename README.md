@@ -11,6 +11,20 @@ BAAR is a lightweight archiver implemented in C. The primary interface is a comm
 
 IMPORTANT: The content below documents the CLI behavior (actual implemented commands and options) and describes the GUI features in detail. The CLI documentation reflects the implemented behavior in the source code.
 
+## What's new
+
+- Compact CLI progress output: when running compact CLI flows (default non-verbose mode), filenames are shown as a basename together with a percentage in parentheses, for example:
+
+    ./baar a my.baar file1.txt
+    Adding files: file1.txt (32%)
+
+    This keeps the CLI compact and suitable for terminals where space is limited. Verbose mode (or `--verbose`) retains full path output and an activity spinner.
+
+- Owner restoration on extract (root-only): when extracting as root (`sudo`), BAAR restores stored file ownership (uid/gid) from the archive. When extracting as a regular user, files are created with the extracting user's ownership.
+    - This applies to both the native `.baar` format and libarchive-based reads (ZIP/TAR) where stored uid/gid information is available. For libarchive extraction the program sets owner restoration flags when run as root.
+
+- Installation: `make install` honors `PREFIX` and `DESTDIR`, suitable for packaging and installing directly under `/usr`.
+
 ## Command-line (CLI) usage
 
 The CLI supports the following subcommands and options (exact behavior implemented in `src/baar.c`):
@@ -52,6 +66,13 @@ Ignore glob-matching files while archiving:
 - Extract archive:
     - `baar x <archive> [dest_dir] [-p password]`
         - Extract all files from `<archive>` into `dest_dir` (current directory if omitted).
+        - When run as root (for example with `sudo`), BAAR attempts to restore the original ownership (uid/gid) stored in the archive. When executed as a regular user, extracted files are created using the extracting user's ownership.
+                - Example (owner restoration when run as root):
+                    ```sh
+                    sudo ./baar x my.baar ./out
+                    ls -l ./out
+                    # files previously owned by root inside the archive will be restored as root-owned here
+                    ```
 
 - List contents:
     - `baar l <archive> [-j|--json]`
@@ -114,6 +135,16 @@ Examples:
 ./baar --gui my.baar            # Launch GUI and open archive
 ```
 
+### CLI progress output (compact / verbose)
+
+- Compact CLI: By default, in non-verbose CLI mode BAAR prints progress compactly by showing only the base filename followed immediately by the percentage in parentheses, for example:
+
+    Adding files: file1.txt (32%)
+
+    This format keeps the CLI output short and readable on narrow terminals.
+- Verbose CLI: Use `--verbose` or environment variable `BAAR_VERBOSE=1` to show full paths and a spinner with richer status text.
+
+
 ## GUI (GTK4) — detailed description
 
 The GUI is an optional frontend implemented with GTK4. It provides an interactive archive browser and common operations. The GUI mirrors many CLI operations but is intended for manual interaction rather than automation. The GUI mode is enabled with `--gui`.
@@ -138,6 +169,7 @@ High-level GUI features and user interactions:
 
     - Extracting files:
         - Select one or more entries and click the extract/save icon. The GUI will extract the selected entries to a destination chosen by the user. When dragging files out to the file manager (external drag), files are temporarily extracted to a per-process temporary directory such as `/tmp/baar_drag_<pid>/` and provided to the desktop as regular files for the drag operation.
+        - If the GUI is running with elevated privileges (for example when invoked as root), BAAR will attempt to restore original ownership (uid/gid) for extracted files where stored in the archive.
 
     - Drag & drop behavior (bidirectional):
         - Drag IN (into BAAR):
@@ -171,21 +203,21 @@ make
 Install to system locations:
 
 By default `make install` installs files under the chosen prefix (default: `/usr/local`).
-You can override the prefix like this: `sudo make prefix=/usr install`.
+You can override the prefix like this: `sudo make PREFIX=/usr install`.
 
-Typical install destinations (where `${prefix}` defaults to `/usr/local`):
+Typical install destinations (where `${PREFIX}` defaults to `/usr/local`):
 
 - Binary:
-    - ${prefix}/bin/baar
+    - ${PREFIX}/bin/baar
 - Desktop entry (desktop file):
-    - ${prefix}/share/applications/baar.desktop
+    - ${PREFIX}/share/applications/baar.desktop
 - AppStream / metainfo (if present):
-    - ${prefix}/share/metainfo/baar.xml
+    - ${PREFIX}/share/metainfo/baar.xml
 - Man pages (if provided by the build):
-    - ${prefix}/share/man/man1/baar.1
+    - ${PREFIX}/share/man/man1/baar.1
 - Icons and other shared data (only if the project provides them):
-    - ${prefix}/share/icons/hicolor/<size>/apps/
-    - ${prefix}/share/icons/...
+    - ${PREFIX}/share/icons/hicolor/<size>/apps/
+    - ${PREFIX}/share/icons/...
 
 Install / uninstall commands:
 
@@ -193,11 +225,14 @@ Install / uninstall commands:
 # Install the built binary and resources to system locations (default: /usr/local)
 sudo make install
 
-# To use a different prefix (for example /usr):
-sudo make prefix=/usr install
+# To install into a different prefix (for example /usr), and using DESTDIR for packaging:
+sudo make PREFIX=/usr install
 
-# To uninstall the files previously installed by `make install`:
-sudo make uninstall
+# To install into a staging directory for packaging (recommended for building packages):
+sudo make PREFIX=/usr DESTDIR=/tmp/tmpinst install
+
+# To uninstall the files previously installed by `make install` (matches PREFIX used for install):
+sudo make PREFIX=/usr uninstall
 ```
 
 ### Requirements (development packages)
@@ -235,86 +270,8 @@ Run GUI:
 - Archive layout: data blobs are written first and a JSON-like index is written at the end; the header contains a pointer to the index offset. This enables the CLI to quickly read the index from the end of the file.
 - Limitations: there is no authenticated encryption (no MAC/AES-GCM), some extended metadata may not be preserved, and rebuilding very large archives can be slow because the index is at the end.
 
-# Installation and Running
+## Build & Test Status (local)
 
-## Requirements
-
-To build and run you need:
-
-- C compiler (gcc or clang)
-- make
-- zlib development libraries (e.g. `zlib1g-dev` on Debian/Ubuntu)
-- libarchive development libraries (e.g. `libarchive-dev` on Debian/Ubuntu)
-- GTK4 development libraries (for GUI, e.g. `libgtk-4-dev` on Debian/Ubuntu)
-
-## Installing required packages
-
-### Debian/Ubuntu:
-
-```sh
-sudo apt update
-sudo apt install build-essential zlib1g-dev libarchive-dev libgtk-4-dev
-```
-
-### Fedora:
-
-```sh
-sudo dnf install gcc make zlib-devel libarchive-devel gtk4-devel
-```
-
-### Arch Linux:
-
-```sh
-sudo pacman -S base-devel zlib libarchive gtk4
-```
-
-### Solus:
-
-```sh
-sudo eopkg install -c system.devel
-sudo eopkg install zlib-devel libarchive-devel gtk4-devel
-```
-
-## Building
-
-```sh
-make
-```
-
-## Installation
-
-```sh
-sudo make install
-```
-
-## Running
-
-```sh
-./baar --help
-```
-or for GUI:
-```sh
-./baar --gui
-```
-    - Metadata (permissions, modification time) is preserved
-    - Only files can be dragged out (folders are not supported)
-    - Encrypted archives are not supported for drag-out
-
-Notes:
-
-- Password protection uses PBKDF2 (100k iterations) + HMAC-SHA256 pseudostream (XOR with keystream blocks); CRC validates password correctness before writing files. For compatibility, set `BAAR_LEGACY_XOR=1` for legacy XOR mode.
-- Format: data blobs first, index at end; header stores index offset.
-- Deleting entries and rebuild rewrite the archive.
-
-Build & Test Status (local):
-
-- Build: PASS (compiled with gcc, small warning about unused helper)
-- Basic tests: PASS (create, list, test, extract, remove, fix, password)
-
-Limitations:
-
-- Currently no authentication (HMAC generates keystream, not MAC); wrong password detected via CRC. For real security, add AES-GCM with tag.
-- No comprehensive directory metadata support (some attributes not captured).
- - Basic POSIX mode/uid/gid/mtime and arbitrary key/value pairs are stored in the index.
-- Index at end means slower rebuild for very large archives.
+- Build: PASS (compiled with gcc, small warning about an unused helper)
+- Basic tests: PASS (create, list, test, extract, remove, rebuild, password)
 

@@ -1,4 +1,4 @@
-#define BAAR_HEADER "BAAR v0.28, \xC2\xA9 BArko, 2025"
+#define BAAR_HEADER "BAAR v0.30, \xC2\xA9 BArko, 2025"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,6 +28,19 @@
 #include <openssl/hmac.h>
 #include <openssl/sha.h>
 #include <openssl/err.h>
+
+static const char *compact_basename(const char *path, char *buf, size_t buflen){
+    if(!path){ if(buflen>0) buf[0]='\0'; return buf; }
+    size_t n = strlen(path);
+    while(n>0 && path[n-1] == '/') n--;
+    size_t start = 0;
+    for(size_t i=0;i<n;i++) if(path[i] == '/') start = i+1;
+    size_t len = n > start ? n - start : 0;
+    if(len >= buflen) len = buflen - 1;
+    if(len) memcpy(buf, path + start, len);
+    buf[len] = '\0';
+    return buf;
+}
 
 static void fmt_size(uint64_t n, char *out, size_t outlen){
     const char *units[] = {"B","KB","MB","GB","TB"};
@@ -84,6 +97,14 @@ static void xor_buf(unsigned char *buf, size_t len, const char *pwd);
 
 static int global_quiet = 0;
 static int global_verbose = 0;
+
+static void safe_chown_path(const char *path, uint32_t uid, uint32_t gid){
+    if(!path) return;
+    if(geteuid() != 0) return;
+    if(chown(path, (uid_t)uid, (gid_t)gid) != 0){
+        if(global_verbose) fprintf(stderr, "Warning: chown %s -> %u:%u failed: %s\n", path, (unsigned)uid, (unsigned)gid, strerror(errno));
+    }
+}
 
 static void usage(){
     fprintf(stderr,
@@ -2047,6 +2068,7 @@ static void on_extract_response(GtkDialog *d, int response_id, gpointer user_dat
 
 
                                         chmod(out_path, e->mode);
+                                        if(geteuid() == 0) safe_chown_path(out_path, e->uid, e->gid);
                                         struct utimbuf times;
                                         times.actime = e->mtime;
                                         times.modtime = e->mtime;
@@ -2055,7 +2077,8 @@ static void on_extract_response(GtkDialog *d, int response_id, gpointer user_dat
                                         extracted++;
                                         double frac = (double)extracted / (double)count;
                                         char pbuf[256];
-                                        snprintf(pbuf, sizeof(pbuf), "%d/%d: %s", extracted, count, e->name);
+                                        char bn[PATH_MAX]; compact_basename(e->name, bn, sizeof(bn));
+                                        snprintf(pbuf, sizeof(pbuf), "%d/%d: %.200s", extracted, count, bn);
                                         update_progress(frac, pbuf);
                                     }
 
@@ -2307,6 +2330,7 @@ static void on_row_activated(GtkListBox *box, GtkListBoxRow *row, gpointer user_
 
                                     mode_t mode = archive_entry_mode(entry);
                                     chmod(out_path, mode);
+                                    if(geteuid() == 0) safe_chown_path(out_path, (uint32_t)archive_entry_uid(entry), (uint32_t)archive_entry_gid(entry));
                                     time_t mtime = archive_entry_mtime(entry);
                                     struct utimbuf times;
                                     times.actime = mtime;
@@ -2440,6 +2464,7 @@ static void on_row_activated(GtkListBox *box, GtkListBoxRow *row, gpointer user_
                             FILE *of = fopen(out_path, "wb");
                             if(of){ fwrite(out,1,outsz,of); fclose(of);
                                 chmod(out_path, e->mode);
+                                if(geteuid() == 0) safe_chown_path(out_path, e->uid, e->gid);
                                 struct utimbuf times; times.actime = e->mtime; times.modtime = e->mtime; utime(out_path, &times);
                             }
 
@@ -2541,6 +2566,7 @@ static GdkContentProvider* on_drag_prepare(GtkDragSource *source, double x, doub
                 char base_folder_path[PATH_MAX * 2];
                 snprintf(base_folder_path, sizeof(base_folder_path), "%s/%s", temp_dir, base_folder);
                 mkdir(base_folder_path, 0755);
+                /* ownership for libarchive-extracted folders is handled by libarchive (if privileged) */
 
 
                 for(uint32_t i=0; i<g_current_index.n; i++){
@@ -2710,6 +2736,7 @@ static GdkContentProvider* on_drag_prepare(GtkDragSource *source, double x, doub
                             if(*c == '/'){
                                 *c = '\0';
                                 mkdir(temp_path, 0755);
+                                if(geteuid() == 0) safe_chown_path(temp_path, e->uid, e->gid);
                                 *c = '/';
                             }
                         }
@@ -2754,6 +2781,7 @@ static GdkContentProvider* on_drag_prepare(GtkDragSource *source, double x, doub
 
 
                         chmod(temp_path, e->mode);
+                        if(geteuid() == 0) safe_chown_path(temp_path, e->uid, e->gid);
                         struct utimbuf times;
                         times.actime = e->mtime;
                         times.modtime = e->mtime;
@@ -2837,6 +2865,7 @@ static GdkContentProvider* on_drag_prepare(GtkDragSource *source, double x, doub
 
 
                         chmod(temp_path, e->mode);
+                        if(geteuid() == 0) safe_chown_path(temp_path, e->uid, e->gid);
                         struct utimbuf times;
                         times.actime = e->mtime;
                         times.modtime = e->mtime;
@@ -6027,7 +6056,9 @@ static int add_files(const char *archive, filepair_t *filepairs, int *clevels, i
             spinner_run = 0;
             if(spinner_created){ pthread_join(spinner_thread, NULL); }
             if(sarg) free(sarg);
-            fprintf(stderr, "\r%s ... (%u%%)\n", path, percent);
+            const char *base_name = strrchr(path, '/');
+            base_name = base_name ? base_name + 1 : path;
+            fprintf(stderr, "%s (%u%%)\n", base_name, percent);
 
             if(enc_buf) free(enc_buf);
             if(out) free(out);
@@ -6254,11 +6285,17 @@ static int process_single_file(add_stream_ctx_t *ctx,
         percent = (unsigned int)p;
     }
     if(global_verbose){ fprintf(stderr, "%s ... (%u%%)\n", src_path, percent); }
-    else { fprintf(stderr, "\rAdding files: %s ... (%u%%)", src_path, percent); fflush(stderr); }
+    else {
+        const char *base = strrchr(src_path, '/');
+        base = base ? base + 1 : src_path;
+        fprintf(stderr, "\rAdding files: %s (%u%%)\x1b[K", base, percent);
+        fflush(stderr);
+    }
 
     if(enc_buf) free(enc_buf);
     if(out) free(out);
     if(buf) free(buf);
+    if(!global_quiet && !global_verbose) fprintf(stderr, "\n");
     return 0;
 }
 
@@ -6576,6 +6613,7 @@ static int list_archive(const char *archive, int json){
         }
         printf("]\n");
     }
+    if(!global_quiet && !global_verbose) fprintf(stderr, "\n");
     free_index(&idx); fclose(f); return 0;
 }
 
@@ -6616,6 +6654,8 @@ static int search_archive(const char *archive, const char *pattern, int json){
 static int extract_archive(const char *archive, const char *dest, const char *pwd){
     FILE *f = fopen(archive, "rb"); if(!f){ perror("open"); return 1; }
     index_t idx = load_index(f);
+    uint32_t total_entries = 0; for(uint32_t ii=0; ii<idx.n; ii++) if(!(idx.entries[ii].flags & 4)) total_entries++;
+    uint32_t processed_entries = 0;
     for(uint32_t i=0;i<idx.n;i++){
         entry_t *e = &idx.entries[i];
         if(e->flags & 4) continue;
@@ -6650,6 +6690,11 @@ static int extract_archive(const char *archive, const char *dest, const char *pw
         if(!outf){ fprintf(stderr,"Cannot write to %s: %s\n", outpath, strerror(errno)); }
         else { fwrite(out,1,outsz,outf); fclose(outf); }
         free(enc); free(out);
+        processed_entries++;
+        if(!global_quiet){
+            if(global_verbose) fprintf(stderr, "Extracted: %s\n", e->name);
+            else { char bn[PATH_MAX]; compact_basename(e->name, bn, sizeof(bn)); unsigned int prog = 0; if(total_entries>0) prog = (unsigned int)(processed_entries * 100ULL / total_entries); fprintf(stderr, "\rExtracting %u/%u: %s (%u%%)\x1b[K", processed_entries, total_entries, bn, prog); fflush(stderr); }
+        }
     }
     free_index(&idx); fclose(f); return 0;
 }
@@ -6849,7 +6894,7 @@ static int rebuild_archive(const char *archive, const uint32_t *exclude_ids, uin
         if(!quiet){
             if(total_to_copy>0){ unsigned int prog = (unsigned int)(total_copied * 100ULL / total_to_copy);
                 if(global_verbose) fprintf(stderr, "(%u%%)\n", prog);
-                else { fprintf(stderr, "(%u%%)", prog); fflush(stderr); }
+                else { char bn[PATH_MAX]; compact_basename(e->name, bn, sizeof(bn)); fprintf(stderr, "\rRebuilding: %s (%u%%)\x1b[K", bn, prog); fflush(stderr); }
             }
             else { if(global_verbose) fprintf(stderr, "\n"); else { fprintf(stderr, "\r"); fflush(stderr); } }
         }
@@ -6915,6 +6960,8 @@ static int compress_archive(const char *archive, int target_clevel, const char *
     ensure_header(out);
 
     index_t newidx = {0}; newidx.next_id = 1;
+    uint32_t total_entries = 0; for(uint32_t ii=0; ii<idx.n; ii++){ if(!(idx.entries[ii].flags & 4)) total_entries++; }
+    uint32_t processed_entries = 0;
     for(uint32_t i=0;i<idx.n;i++){
         entry_t *e = &idx.entries[i];
         if(e->flags & 4) continue;
@@ -6972,7 +7019,12 @@ static int compress_archive(const char *archive, int target_clevel, const char *
 
     ne->mode = e->mode; ne->uid = e->uid; ne->gid = e->gid; ne->mtime = e->mtime;
     ne->meta_n = e->meta_n; if(e->meta_n){ ne->meta = calloc(e->meta_n, sizeof(*ne->meta)); for(uint32_t m=0;m<e->meta_n;m++){ ne->meta[m].key = e->meta[m].key?strdup(e->meta[m].key):NULL; ne->meta[m].value = e->meta[m].value?strdup(e->meta[m].value):NULL; } } else ne->meta = NULL;
-    newidx.n++; if(ne->id >= newidx.next_id) newidx.next_id = ne->id+1;
+        newidx.n++; if(ne->id >= newidx.next_id) newidx.next_id = ne->id+1;
+        processed_entries++;
+        if(!global_quiet){ unsigned int prog = 0; if(total_entries>0) prog = (unsigned int)(processed_entries * 100ULL / total_entries);
+            if(global_verbose) fprintf(stderr, "Recompressing id %u %s (%u%%)\n", e->id, e->name, prog);
+            else { char bn[PATH_MAX]; compact_basename(e->name, bn, sizeof(bn)); fprintf(stderr, "\rCompressing: %s (%u%%)", bn, prog); fflush(stderr); }
+        }
 
         if(!(e->flags & 2) && !(final_blob==blob)) free(blob);
         if(!(e->flags & 2) && !(final_blob==NULL) && final_blob!=blob) {   }
@@ -6992,6 +7044,7 @@ static int compress_archive(const char *archive, int target_clevel, const char *
     if(rename(tmp, archive)!=0){ perror("rename tmp"); if(bak) { rename(bak, archive); free(bak); } free(tmp); return 1; }
     if(bak){ unlink(bak); free(bak); }
     free(tmp);
+    if(!global_quiet && !global_verbose) fprintf(stderr, "\n");
     return 0;
 }
 
@@ -7384,6 +7437,7 @@ int main(int argc, char **argv){
             if(jobs[j].archive_override) free(jobs[j].archive_override);
         }
         free(jobs);
+        if(!global_quiet && !global_verbose) fprintf(stderr, "\n");
         free_ignore_patterns(ignore_patterns, ignore_count);
         return res;
     } else if(strcmp(cmd,"l")==0){ return list_archive(archive, json); }
