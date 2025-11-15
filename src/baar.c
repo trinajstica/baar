@@ -1,4 +1,4 @@
-#define BAAR_HEADER "BAAR v0.36, \xC2\xA9 BArko, 2025"
+#define BAAR_HEADER "BAAR v0.38, \xC2\xA9 BArko, 2025"
 
 const char *baar_header_string(void) {
     return BAAR_HEADER;
@@ -5221,6 +5221,7 @@ typedef struct {
     int mirror_mode;
     char **ignore_patterns;
     size_t ignore_count;
+    uint64_t archive_mtime;
 } add_stream_ctx_t;
 
 static char *build_child_path(const char *parent, const char *name){
@@ -6057,6 +6058,9 @@ static int add_files(const char *archive, filepair_t *filepairs, int *clevels, i
     if(!f) f = fopen(archive, "w+b");
     if(!f) { perror("open archive"); return 1; }
     ensure_header(f);
+    uint64_t archive_mtime = 0;
+    struct stat arch_st;
+    if(stat(archive, &arch_st) == 0){ archive_mtime = (uint64_t)arch_st.st_mtime; }
     index_t idx = load_index(f);
     const char *mirror_debug = getenv("BAAR_DEBUG_MIRROR");
 
@@ -6159,9 +6163,23 @@ static int add_files(const char *archive, filepair_t *filepairs, int *clevels, i
             if(incremental_mode){
                 if(plan->stat_ok && plan->readable && plan->existing_valid){
                     if(plan->existing_uncomp == (uint64_t)plan->st.st_size &&
-                       plan->existing_mtime == (uint64_t)plan->st.st_mtime &&
                        (plan->existing_mode & 07777u) == (uint32_t)(plan->st.st_mode & 07777u)){
-                        plan->action = FILE_PLAN_SKIP_UNCHANGED;
+                        /* If mtimes match exactly, skip unchanged (fast-path) */
+                        if(plan->existing_mtime == (uint64_t)plan->st.st_mtime){
+                            plan->action = FILE_PLAN_SKIP_UNCHANGED;
+                        } else {
+                            /* If st_mtime and existing_mtime are both older or equal to the archive
+                               mtime, treat as unchanged (handles mirrored copies and small clock shifts). */
+                                     /* allow a small grace window after archive modification to account
+                                         for mirroring, time skew, and copy utilities which may update mtime
+                                         within a short period; default is 1 hour */
+                                     uint64_t grace = 60ULL * 60ULL;
+                                     if(archive_mtime != 0 &&
+                                         (uint64_t)plan->st.st_mtime <= (archive_mtime + grace) &&
+                                         plan->existing_mtime <= (archive_mtime + grace)){
+                                plan->action = FILE_PLAN_SKIP_UNCHANGED;
+                            }
+                        }
                     }
                 }
             }
@@ -6483,12 +6501,22 @@ static int process_single_file(add_stream_ctx_t *ctx,
         }
         if(ctx->incremental_mode){
             if(existing->uncomp_size == (uint64_t)st->st_size &&
-               existing->mtime == (uint64_t)st->st_mtime &&
                (existing->mode & 07777u) == (uint32_t)(st->st_mode & 07777u)){
-                if(!global_quiet){
-                    fprintf(stderr, "Skipping unchanged: %s\n", src_path);
+                /* If mtimes match exactly, skip unchanged (fast-path) */
+                if(existing->mtime == (uint64_t)st->st_mtime){
+                    if(!global_quiet){ fprintf(stderr, "Skipping unchanged: %s\n", src_path); }
+                    return 0;
                 }
-                return 0;
+                /* If mtimes differ, but both the archive entry and the file have
+                   mtimes older or equal to the last archive modification time,
+                   we can treat them as unchanged (mirrored updates or clock drift). */
+                     uint64_t grace = 60ULL * 60ULL;
+                     if(ctx->archive_mtime != 0 &&
+                         (uint64_t)st->st_mtime <= (ctx->archive_mtime + grace) &&
+                         existing->mtime <= (ctx->archive_mtime + grace)){
+                    if(!global_quiet){ fprintf(stderr, "Skipping unchanged (by archive mtime): %s\n", src_path); }
+                    return 0;
+                }
             }
         }
         append_unique_id(ctx->to_remove, ctx->remove_count, existing->id);
@@ -7136,10 +7164,17 @@ static int add_files_streaming(const char *archive, add_job_t *jobs, int job_cou
     if(!archive_canon) archive_canon = strdup(archive);
     ctx.archive_path_on_disk = archive_canon;
 
+     /* record archive file modification time for incremental detection
+         This value is used to treat files with mtime <= archive_mtime as unchanged
+         if index entries also predate the archive's mtime. */
+     struct stat arch_st;
+     ctx.archive_mtime = 0;
+     if(stat(archive, &arch_st) == 0){ ctx.archive_mtime = (uint64_t)arch_st.st_mtime; }
+
     /* Compact CLI mode: print header and a single dynamic info line under it */
     if(!global_quiet && !global_verbose){
         fprintf(stderr, "%s\n", BAAR_HEADER);
-        fprintf(stderr, "Adding files: "); fflush(stderr);
+        fprintf(stderr, "Adding files:\n"); fflush(stderr);
     }
 
     int overall_status = 0;
@@ -7949,6 +7984,14 @@ int main(int argc, char **argv){
                 g_initial_gui_archive = strdup(argv[gi+1]);
             }
             return run_gui(argc, argv);
+        }
+    }
+
+    /* Global --version / -V anywhere */
+    for (int gi = 1; gi < argc; gi++) {
+        if (strcmp(argv[gi], "--version") == 0 || strcmp(argv[gi], "-V") == 0) {
+            printf("%s\n", baar_header_string());
+            return 0;
         }
     }
 

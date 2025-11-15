@@ -34,7 +34,8 @@ The CLI supports the following subcommands and options (exact behavior implement
         - Add files or directories to `<archive>` (the `.baar` extension is appended if missing).
         - Files may be specified as `src:dst` to control the path inside the archive.
         - Per-file compression level may also be provided using `src:level` style.
-        - `--incremental` (or `-i`): Only add new or changed files. Existing files in the archive are left untouched, even if they are missing from the source.
+                - `--incremental` (or `-i`): Only add new or changed files. Existing files in the archive are left untouched, even if they are missing from the source.
+                    - Detection compares file metadata (size, mode and mtime). BAAR also compares file mtime against the archive's last modification time: files whose mtime is older than (or equal to) the archive mtime are considered unchanged. To tolerate mirror/copy tools and minor clock skew, BAAR also uses a small grace window (default 1 hour) after the archive mtime to avoid re-adding identical files whose timestamps were updated by mirroring operations.
         - `--mirror` (or `-m`): Mirror mode. In addition to incremental behavior, any files present in the archive but missing from the source are marked as deleted (logical removal). The archive becomes a mirror of the source directory.
         - You can combine both options: `--incremental --mirror` (or `-i -m`). Mirror mode always implies incremental behavior.
         - `--ignore <pattern>`: Skip files, directories, or archive paths matching the provided shell-style glob. You can repeat this option multiple times.
