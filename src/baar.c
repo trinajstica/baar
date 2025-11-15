@@ -1,4 +1,4 @@
-#define BAAR_HEADER "BAAR v0.30, \xC2\xA9 BArko, 2025"
+#define BAAR_HEADER "BAAR v0.32, \xC2\xA9 BArko, 2025"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -62,6 +62,8 @@ static void fmt_size(uint64_t n, char *out, size_t outlen){
 typedef struct {
     uint32_t id;
     char *name;
+    uint64_t name_off;
+    uint16_t name_len;
     uint8_t flags;
     uint8_t comp_level;
     uint64_t data_offset;
@@ -79,18 +81,23 @@ typedef struct {
         char *value;
     } *meta;
     uint32_t meta_n;
+    uint64_t meta_off;
 } entry_t;
 
 typedef struct {
     entry_t *entries;
     uint32_t n;
     uint32_t next_id;
+    FILE *archive_fp; /* duplicate of archive FILE* for lazy reads */
 } index_t;
 
 
 static index_t load_index(FILE *f);
 static index_t load_libarchive_index(const char *path);
 static void free_index(index_t *idx);
+static const char *entry_get_name(index_t *idx, entry_t *e);
+static int entry_load_meta(index_t *idx, entry_t *e);
+static void entry_free_meta(entry_t *e);
 
 static int rebuild_archive(const char *archive, const uint32_t *exclude_ids, uint32_t exclude_count, int quiet);
 
@@ -428,15 +435,16 @@ static void populate_list_from_index(void){
     for(uint32_t i=0;i<g_current_index.n;i++){
         entry_t *e = &g_current_index.entries[i];
         if(e->flags & 4) continue;
-
+        const char *ename = entry_get_name(&g_current_index, e);
+        if(!ename) continue;
 
         if(g_current_is_libarchive){
 
             if(plen > 0){
-                if(strncmp(e->name, g_current_prefix, plen) != 0) continue;
+                if(strncmp(ename, g_current_prefix, plen) != 0) continue;
             }
 
-            const char *display_part = plen > 0 ? e->name + plen : e->name;
+            const char *display_part = plen > 0 ? ename + plen : ename;
             size_t display_len = strlen(display_part);
 
 
@@ -448,15 +456,15 @@ static void populate_list_from_index(void){
 
                 if(slash_pos == display_part + display_len - 1){
 
-                    if(!folder_view_exists(folders_to_show, folder_count, e->name)){
-                        folder_view_add(&folders_to_show, &folder_count, e, e->name);
+                    if(!folder_view_exists(folders_to_show, folder_count, ename)){
+                        folder_view_add(&folders_to_show, &folder_count, e, ename);
                     }
                     continue;
                 }
             }
 
 
-            const char *next_slash = strchr(display_part, '/');
+                const char *next_slash = strchr(display_part, '/');
 
             if(next_slash){
 
@@ -471,7 +479,7 @@ static void populate_list_from_index(void){
 
                 if(!folder_view_exists(folders_to_show, folder_count, folder_path)){
 
-                    printf("DEBUG: Adding virtual folder for path '%s' (from entry '%s')\n", folder_path, e->name);
+                    printf("DEBUG: Adding virtual folder for path '%s' (from entry '%s')\n", folder_path, ename);
                     folder_view_add(&folders_to_show, &folder_count, e, folder_path);
                 }
             } else {
@@ -485,15 +493,15 @@ static void populate_list_from_index(void){
 
 
         if(plen>0){
-            if(strncmp(e->name, g_current_prefix, plen)!=0) continue;
-            const char *rest = e->name + plen;
+            if(strncmp(ename, g_current_prefix, plen)!=0) continue;
+            const char *rest = ename + plen;
             size_t restlen = strlen(rest);
             if(restlen == 0) continue;
 
             if(rest[restlen-1] == '/'){
                 if(strchr(rest, '/') != rest + restlen - 1) continue;
-                if(!folder_view_exists(folders_to_show, folder_count, e->name)){
-                    folder_view_add(&folders_to_show, &folder_count, e, e->name);
+                if(!folder_view_exists(folders_to_show, folder_count, ename)){
+                    folder_view_add(&folders_to_show, &folder_count, e, ename);
                 }
                 continue;
             }
@@ -518,22 +526,22 @@ static void populate_list_from_index(void){
             continue;
         }
 
-        size_t namelen = strlen(e->name);
+        size_t namelen = strlen(ename);
         if(namelen == 0) continue;
 
-        if(e->name[namelen-1] == '/'){
-            if(strchr(e->name, '/') != e->name + namelen - 1) continue;
-            if(!folder_view_exists(folders_to_show, folder_count, e->name)){
-                folder_view_add(&folders_to_show, &folder_count, e, e->name);
+        if(ename[namelen-1] == '/'){ 
+            if(strchr(ename, '/') != ename + namelen - 1) continue;
+            if(!folder_view_exists(folders_to_show, folder_count, ename)){
+                folder_view_add(&folders_to_show, &folder_count, e, ename);
             }
             continue;
         }
 
-        const char *next_slash = strchr(e->name, '/');
+            const char *next_slash = strchr(ename, '/');
         if(next_slash){
-            size_t folder_len = next_slash - e->name;
+            size_t folder_len = next_slash - ename;
             char folder_path[4096];
-            snprintf(folder_path, sizeof(folder_path), "%.*s/", (int)folder_len, e->name);
+            snprintf(folder_path, sizeof(folder_path), "%.*s/", (int)folder_len, ename);
             if(!folder_view_exists(folders_to_show, folder_count, folder_path)){
                 folder_view_add(&folders_to_show, &folder_count, e, folder_path);
             }
@@ -550,10 +558,12 @@ static void populate_list_from_index(void){
 
         for(int idx = 0; idx < count; idx++){
             entry_t *e = (pass == 0) ? folders_to_show[idx].entry : files_to_show[idx];
-            if(!e || !e->name) continue;
+            if(!e) continue;
+            const char *ename = entry_get_name(&g_current_index, e);
+            if(!ename) continue;
 
-            size_t ename_len = strlen(e->name);
-            const char *effective_path = (pass == 0) ? (folders_to_show[idx].path ? folders_to_show[idx].path : e->name) : e->name;
+            size_t ename_len = strlen(ename);
+            const char *effective_path = (pass == 0) ? (folders_to_show[idx].path ? folders_to_show[idx].path : ename) : ename;
 
             const char *display_name = effective_path;
             if(pass == 0 && plen > 0 && strncmp(effective_path, g_current_prefix, plen) == 0){
@@ -561,8 +571,8 @@ static void populate_list_from_index(void){
                 if(!display_name[0]) display_name = effective_path;
             }
             if(pass == 1){
-                display_name = e->name + plen;
-                if(!display_name || !display_name[0]) display_name = e->name;
+                display_name = ename + plen;
+                if(!display_name || !display_name[0]) display_name = ename;
             }
 
 
@@ -593,7 +603,7 @@ static void populate_list_from_index(void){
 
             GtkWidget *lbl_size = NULL;
 
-            int is_folder = (pass == 0) || (ename_len > 0 && e->name[ename_len-1] == '/');
+            int is_folder = (pass == 0) || (ename_len > 0 && ename[ename_len-1] == '/');
             if(is_folder){
 
             uint32_t child_count = 0;
@@ -602,14 +612,16 @@ static void populate_list_from_index(void){
             if(pass == 0){
                 snprintf(folder_path_for_count, sizeof(folder_path_for_count), "%s", effective_path);
             } else {
-                snprintf(folder_path_for_count, sizeof(folder_path_for_count), "%s", e->name);
+                snprintf(folder_path_for_count, sizeof(folder_path_for_count), "%s", ename);
             }
             size_t prefix_len = strlen(folder_path_for_count);
             for(uint32_t j=0;j<g_current_index.n;j++){
                 entry_t *ce = &g_current_index.entries[j];
                 if(ce->flags & 4) continue;
-                if(strncmp(ce->name, folder_path_for_count, prefix_len) != 0) continue;
-                const char *rest2 = ce->name + prefix_len;
+                const char *cename = entry_get_name(&g_current_index, ce);
+                if(!cename) continue;
+                if(strncmp(cename, folder_path_for_count, prefix_len) != 0) continue;
+                const char *rest2 = cename + prefix_len;
                 size_t rlen2 = strlen(rest2);
                 if(rlen2 == 0) continue;
                 if(rlen2 > 0 && rest2[rlen2-1] == '/'){
@@ -674,7 +686,7 @@ static void populate_list_from_index(void){
         if(pass == 0){
             rd->name = strdup(effective_path);
         } else {
-            rd->name = strdup(e->name);
+            rd->name = strdup(ename);
         }
 
         rd->flags = e->flags; rd->comp_level = e->comp_level; rd->comp_size = e->comp_size; rd->uncomp_size = e->uncomp_size; rd->crc32 = e->crc32;
@@ -696,7 +708,7 @@ static void populate_list_from_index(void){
 
         if(!g_current_is_libarchive){
 
-            const char *drop_path = (pass == 0) ? effective_path : e->name;
+            const char *drop_path = (pass == 0) ? effective_path : ename;
             size_t drop_len = drop_path ? strlen(drop_path) : 0;
             if(drop_path && drop_len > 0 && drop_path[drop_len-1] == '/'){
 
@@ -752,10 +764,12 @@ static void update_info_panel(void){
         entry_t *e = &g_current_index.entries[i];
         if(e->flags & 4) continue;
         total_active++;
+        const char *ename = entry_get_name(&g_current_index, e);
+        if(!ename) continue;
 
         if(plen>0){
-            if(strncmp(e->name, g_current_prefix, plen)!=0) continue;
-            const char *rest = e->name + plen;
+            if(strncmp(ename, g_current_prefix, plen)!=0) continue;
+            const char *rest = ename + plen;
             size_t restlen = strlen(rest);
 
             if(restlen == 0) continue;
@@ -766,11 +780,11 @@ static void update_info_panel(void){
             }
             shown++;
         } else {
-            size_t namelen = strlen(e->name);
-            if(namelen > 0 && e->name[namelen-1] == '/'){
-                if(strchr(e->name, '/') != e->name + namelen - 1) continue;
+            size_t namelen = strlen(ename);
+            if(namelen > 0 && ename[namelen-1] == '/'){
+                if(strchr(ename, '/') != ename + namelen - 1) continue;
             } else {
-                if(strchr(e->name, '/')) continue;
+                if(strchr(ename, '/')) continue;
             }
             shown++;
         }
@@ -1323,7 +1337,8 @@ static void on_newfolder_response(GtkDialog *d, int response_id, gpointer entry_
                 ensure_header(f);
                 index_t idx = load_index(f);
                 for(uint32_t i = 0; i < idx.n; i++){
-                    if(idx.entries[i].name && strcmp(idx.entries[i].name, fullpath) == 0 && !(idx.entries[i].flags & 0x04)){
+                    const char *ename = entry_get_name(&idx, &idx.entries[i]);
+                    if(ename && strcmp(ename, fullpath) == 0 && !(idx.entries[i].flags & 0x04)){
                         exists = 1;
                         break;
                     }
@@ -1400,11 +1415,11 @@ static void on_file_overwrite_response(GtkDialog *dialog, gint response, gpointe
 
 
                     for(uint32_t j = 0; j < idx.n; j++){
-                        if(j != i && strcmp(idx.entries[j].name, data->target_name) == 0){
+                        if(j != i){ const char *jname = entry_get_name(&idx, &idx.entries[j]); if(jname && strcmp(jname, data->target_name) == 0) {
                             idx.entries[j].flags |= 4;
                             modified = 1;
                             break;
-                        }
+                        } }
                     }
                     break;
                 }
@@ -1467,7 +1482,9 @@ static void on_remove_response(GtkDialog *d, int response_id, gpointer user_data
                 for(uint32_t i=0; i<g_current_index.n; i++){
                     entry_t *e = &g_current_index.entries[i];
                     if(e->flags & 4) continue;
-                    if(strncmp(e->name, rd->name, nlen) == 0){
+                    const char *ename = entry_get_name(&g_current_index, e);
+                    if(!ename) continue;
+                    if(strncmp(ename, rd->name, nlen) == 0){
                         to_exclude = realloc(to_exclude, sizeof(uint32_t)*(ex_count+1));
                         to_exclude[ex_count++] = e->id;
                     }
@@ -1970,12 +1987,13 @@ static void on_extract_response(GtkDialog *d, int response_id, gpointer user_dat
                             if(nlen > 0 && rd->name[nlen-1] == '/') continue;
 
 
-                            for(uint32_t i=0; i<idx.n; i++){
+                                for(uint32_t i=0; i<idx.n; i++){
                                 entry_t *e = &idx.entries[i];
                                 if(e->id == rd->id && !(e->flags & 4)){
+                                    const char *ename = entry_get_name(&idx, e);
 
                                     char out_path[4096];
-                                    snprintf(out_path, sizeof(out_path), "%s/%s", dest_path, e->name);
+                                    snprintf(out_path, sizeof(out_path), "%s/%s", dest_path, ename);
 
 
                                     char *dup = strdup(out_path);
@@ -2080,7 +2098,7 @@ static void on_extract_response(GtkDialog *d, int response_id, gpointer user_dat
                                         extracted++;
                                         double frac = (double)extracted / (double)count;
                                         char pbuf[256];
-                                        char bn[PATH_MAX]; compact_basename(e->name, bn, sizeof(bn));
+                                        char bn[PATH_MAX]; compact_basename(ename, bn, sizeof(bn));
                                         snprintf(pbuf, sizeof(pbuf), "%d/%d: %.200s", extracted, count, bn);
                                         update_progress(frac, pbuf);
                                     }
@@ -2383,9 +2401,11 @@ static void on_row_activated(GtkListBox *box, GtkListBoxRow *row, gpointer user_
                     for(uint32_t i=0;i<idx.n;i++){
                         entry_t *e = &idx.entries[i];
                         if(e->id == rd->id && !(e->flags & 4)){
+                            const char *ename = entry_get_name(&idx, e);
+                            if(!ename) break;
 
-                            size_t elen = strlen(e->name);
-                            if(elen>0 && e->name[elen-1]=='/') break;
+                            size_t elen = strlen(ename);
+                            if(elen>0 && ename[elen-1]=='/') break;
 
 
                             if(e->flags & 2){
@@ -2575,11 +2595,13 @@ static GdkContentProvider* on_drag_prepare(GtkDragSource *source, double x, doub
                 for(uint32_t i=0; i<g_current_index.n; i++){
                     entry_t *e = &g_current_index.entries[i];
                     if(e->flags & 4) continue;
+                    const char *ename = entry_get_name(&g_current_index, e);
+                    if(!ename) continue;
 
-                    size_t elen = strlen(e->name);
-                    if(strncmp(e->name, rd->name, nlen) == 0 && elen > nlen){
+                    size_t elen = strlen(ename);
+                    if(strncmp(ename, rd->name, nlen) == 0 && elen > nlen){
 
-                        const char *relative = e->name + nlen;
+                        const char *relative = ename + nlen;
 
 
                         if(relative[strlen(relative)-1] == '/') continue;
@@ -2589,7 +2611,7 @@ static GdkContentProvider* on_drag_prepare(GtkDragSource *source, double x, doub
                         snprintf(dest_path, sizeof(dest_path), "%s/%s/%s", temp_dir, base_folder, relative);
 
 
-                        if(la_extract_to_path(g_current_archive, e->name, dest_path, g_archive_password) != 0){
+                        if(la_extract_to_path(g_current_archive, ename, dest_path, g_archive_password) != 0){
 
                             continue;
                         }
@@ -2715,12 +2737,13 @@ static GdkContentProvider* on_drag_prepare(GtkDragSource *source, double x, doub
             for(uint32_t i=0; i<idx.n; i++){
                 entry_t *e = &idx.entries[i];
                 if(e->flags & 4) continue;
+                const char *ename = entry_get_name(&idx, e);
+                if(!ename) continue;
 
+                size_t elen = strlen(ename);
+                if(strncmp(ename, rd->name, nlen) == 0 && elen > nlen){
 
-                size_t elen = strlen(e->name);
-                if(strncmp(e->name, rd->name, nlen) == 0 && elen > nlen){
-
-                    const char *relative = e->name + nlen;
+                    const char *relative = ename + nlen;
 
 
                     if(relative[strlen(relative)-1] == '/') continue;
@@ -3046,8 +3069,10 @@ static gboolean on_internal_drop(GtkDropTarget *target, const GValue *value, dou
             for(uint32_t i = 0; i < idx.n; i++){
                 entry_t *e = &idx.entries[i];
                 if(e->id == ids[j] && !(e->flags & 4)){
-                    size_t item_len = strlen(e->name);
-                    int item_is_file = (item_len > 0 && e->name[item_len-1] != '/');
+                    const char *ename = entry_get_name(&idx, e);
+                    if(!ename) continue;
+                    size_t item_len = strlen(ename);
+                    int item_is_file = (item_len > 0 && ename[item_len-1] != '/');
 
                     if(item_is_file){
 
@@ -3072,9 +3097,10 @@ static gboolean on_internal_drop(GtkDropTarget *target, const GValue *value, dou
         for(uint32_t i = 0; i < idx.n; i++){
             entry_t *e = &idx.entries[i];
             if(e->id == move_id && !(e->flags & 4)){
-
+                const char *ename = entry_get_name(&idx, e);
+                if(!ename) continue;
                 char temp_name[4096];
-                strncpy(temp_name, e->name, sizeof(temp_name) - 1);
+                strncpy(temp_name, ename, sizeof(temp_name) - 1);
                 temp_name[sizeof(temp_name) - 1] = '\0';
 
                 size_t len = strlen(temp_name);
@@ -3086,17 +3112,17 @@ static gboolean on_internal_drop(GtkDropTarget *target, const GValue *value, dou
                 if(basename_part) basename_part++;
                 else basename_part = temp_name;
 
-                int is_dir = (strlen(e->name) > 0 && e->name[strlen(e->name)-1] == '/');
+                int is_dir = (strlen(ename) > 0 && ename[strlen(ename)-1] == '/');
 
 
                 size_t tflen = strlen(target_folder);
 
 
-                const char *parent_end = strrchr(e->name, '/');
-                if(parent_end && is_dir && parent_end == &e->name[strlen(e->name)-1]){
+                const char *parent_end = strrchr(ename, '/');
+                if(parent_end && is_dir && parent_end == &ename[strlen(ename)-1]){
 
                     char temp_copy[4096];
-                    strncpy(temp_copy, e->name, sizeof(temp_copy) - 1);
+                    strncpy(temp_copy, ename, sizeof(temp_copy) - 1);
                     temp_copy[sizeof(temp_copy) - 1] = '\0';
                     temp_copy[strlen(temp_copy) - 1] = '\0';
                     parent_end = strrchr(temp_copy, '/');
@@ -3110,8 +3136,8 @@ static gboolean on_internal_drop(GtkDropTarget *target, const GValue *value, dou
                     }
                 } else if(parent_end){
 
-                    size_t parent_len = (parent_end - e->name) + 1;
-                    if(tflen == parent_len && strncmp(target_folder, e->name, parent_len) == 0){
+                    size_t parent_len = (parent_end - ename) + 1;
+                    if(tflen == parent_len && strncmp(target_folder, ename, parent_len) == 0){
                         continue;
                     }
                 } else if(tflen == 0){
@@ -3126,7 +3152,9 @@ static gboolean on_internal_drop(GtkDropTarget *target, const GValue *value, dou
 
                 int target_exists = 0;
                 for(uint32_t j = 0; j < idx.n; j++){
-                    if(j != i && strcmp(idx.entries[j].name, new_name) == 0 && !(idx.entries[j].flags & 4)){
+                    if(j == i) continue;
+                    const char *jname = entry_get_name(&idx, &idx.entries[j]);
+                    if(jname && strcmp(jname, new_name) == 0 && !(idx.entries[j].flags & 4)){
                         target_exists = 1;
                         break;
                     }
@@ -3142,7 +3170,7 @@ static gboolean on_internal_drop(GtkDropTarget *target, const GValue *value, dou
 
                     file_overwrite_data_t *dialog_data = malloc(sizeof(file_overwrite_data_t));
                     if(dialog_data){
-                        dialog_data->src_name = strdup(e->name);
+                        dialog_data->src_name = strdup(ename);
                         dialog_data->target_name = new_name;
                         dialog_data->src_id = e->id;
                         dialog_data->target_folder = strdup(target_folder);
@@ -3197,18 +3225,22 @@ static gboolean on_internal_drop(GtkDropTarget *target, const GValue *value, dou
                 } else {
 
                     if (is_dir) {
-
-                        size_t old_prefix_len = strlen(e->name);
-                        char *old_prefix = strdup(e->name);
+                        const char *ename = entry_get_name(&idx, e);
+                        if(!ename) { free(new_name); continue; }
+                        size_t old_prefix_len = strlen(ename);
+                        char *old_prefix = strdup(ename);
                         free(e->name);
                         e->name = new_name;
                         size_t new_prefix_len = strlen(new_name);
                         for (uint32_t k = 0; k < idx.n; k++) {
                             if (k == i) continue;
                             entry_t *sub = &idx.entries[k];
-                            if (!(sub->flags & 4) && strncmp(sub->name, old_prefix, old_prefix_len) == 0) {
+                            if (!(sub->flags & 4)){
+                                const char *sname = entry_get_name(&idx, sub);
+                                if(!sname) continue;
+                                if(strncmp(sname, old_prefix, old_prefix_len) != 0) continue;
 
-                                const char *suffix = sub->name + old_prefix_len;
+                                const char *suffix = sname + old_prefix_len;
                                 size_t newlen = new_prefix_len + strlen(suffix) + 1;
                                 char *newsub = malloc(newlen);
                                 snprintf(newsub, newlen, "%s%s", new_name, suffix);
@@ -3735,7 +3767,8 @@ static gboolean on_drop(GtkDropTarget *target, const GValue *value, double x, do
 
                     int exists = 0;
                     for(uint32_t j=0; j<idx.n; j++){
-                        if(idx.entries[j].name && strcmp(idx.entries[j].name, dir_with_slash) == 0){
+                        const char *jname = entry_get_name(&idx, &idx.entries[j]);
+                        if(jname && strcmp(jname, dir_with_slash) == 0){
                             exists = 1;
                             break;
                         }
@@ -5093,8 +5126,9 @@ static entry_lookup_item_t *build_entry_lookup_items(index_t *idx, size_t *out_c
     size_t count = 0;
     for(uint32_t i=0;i<idx->n;i++){
         entry_t *e = &idx->entries[i];
-        if(!e->name || (e->flags & 4)) continue;
-        items[count].name = e->name;
+        const char *ename = entry_get_name(idx, e);
+        if(!ename || (e->flags & 4)) continue;
+        items[count].name = ename;
         items[count].index = i;
         count++;
     }
@@ -5352,14 +5386,20 @@ static index_t load_index(FILE *f){
     uint32_t n = read_u32(f);
     idx.n = n;
     idx.entries = calloc(n,sizeof(entry_t));
+    /* duplicate file handle so we can lazy-load names/meta later */
+    idx.archive_fp = NULL;
+    int fd = fileno(f);
+    if(fd >= 0){
+        int dupfd = dup(fd);
+        if(dupfd >= 0){ idx.archive_fp = fdopen(dupfd, "rb"); }
+    }
     uint32_t maxid=0;
     for(uint32_t i=0;i<n;i++){
         entry_t *e = &idx.entries[i];
         e->id = read_u32(f);
     uint16_t namelen = read_u16(f);
-    e->name = malloc(namelen+1);
-    fread(e->name,1,namelen,f);
-    e->name[namelen]=0;
+    e->name = NULL; e->name_len = namelen; e->name_off = ftell(f);
+    if(namelen) fseek(f, namelen, SEEK_CUR);
     /* strip leading slashes so UI shows top-level folders like 'home' instead of '/' */
     if(e->name && e->name[0] == '/'){
         char *tmp = e->name;
@@ -5384,14 +5424,14 @@ static index_t load_index(FILE *f){
 
     e->meta_n = read_u32(f);
     if(e->meta_n){
-        e->meta = calloc(e->meta_n, sizeof(*e->meta));
+        e->meta = NULL; /* not loaded yet */
+        e->meta_off = ftell(f);
+        /* skip meta contents */
         for(uint32_t m=0;m<e->meta_n;m++){
-            uint16_t klen = read_u16(f);
-            if(klen){ e->meta[m].key = malloc(klen+1); fread(e->meta[m].key,1,klen,f); e->meta[m].key[klen]=0; } else e->meta[m].key = NULL;
-            uint16_t vlen = read_u16(f);
-            if(vlen){ e->meta[m].value = malloc(vlen+1); fread(e->meta[m].value,1,vlen,f); e->meta[m].value[vlen]=0; } else e->meta[m].value = NULL;
+            uint16_t klen = read_u16(f); if(klen) fseek(f, klen, SEEK_CUR);
+            uint16_t vlen = read_u16(f); if(vlen) fseek(f, vlen, SEEK_CUR);
         }
-    } else { e->meta = NULL; }
+    } else { e->meta = NULL; e->meta_off = 0; }
     if(e->id>maxid) maxid=e->id;
     }
     idx.next_id = maxid+1;
@@ -5566,6 +5606,8 @@ static index_t load_libarchive_index(const char *path){
         const char *name_trim = name_src;
         while(*name_trim == '/') name_trim++;
         e->name = strdup(name_trim);
+        e->name_len = e->name ? (uint16_t)strlen(e->name) : 0;
+        e->name_off = 0;
 
 
         int64_t size = archive_entry_size_is_set(entry) ? archive_entry_size(entry) : 0;
@@ -5605,14 +5647,71 @@ static index_t load_libarchive_index(const char *path){
 static void free_index(index_t *idx){
     if(!idx) return;
     for(uint32_t i=0;i<idx->n;i++){
-        free(idx->entries[i].name);
-        if(idx->entries[i].meta){
-            for(uint32_t m=0;m<idx->entries[i].meta_n;m++){ free(idx->entries[i].meta[m].key); free(idx->entries[i].meta[m].value); }
-            free(idx->entries[i].meta);
+        entry_t *e = &idx->entries[i];
+        if(e->name) { free(e->name); e->name = NULL; }
+        if(e->meta){
+            entry_free_meta(e);
         }
     }
     free(idx->entries);
     idx->entries=NULL; idx->n=0;
+    if(idx->archive_fp){ fclose(idx->archive_fp); idx->archive_fp = NULL; }
+}
+
+static const char *entry_get_name(index_t *idx, entry_t *e){
+    if(!e) return NULL;
+    if(e->name) return e->name;
+    if(e->name_len == 0){ e->name = strdup(""); return e->name; }
+    if(!idx || !idx->archive_fp) return NULL;
+    long cur = ftell(idx->archive_fp);
+    if(fseek(idx->archive_fp, (long)e->name_off, SEEK_SET) != 0){ if(cur>=0) fseek(idx->archive_fp, cur, SEEK_SET); return NULL; }
+    char *buf = malloc(e->name_len + 1);
+    if(!buf){ if(cur>=0) fseek(idx->archive_fp, cur, SEEK_SET); return NULL; }
+    size_t rn = fread(buf, 1, e->name_len, idx->archive_fp);
+    buf[e->name_len] = 0;
+    if(rn != e->name_len){ free(buf); if(cur>=0) fseek(idx->archive_fp, cur, SEEK_SET); return NULL; }
+    /* strip leading slashes so UI shows top-level folders like 'home' instead of '/' */
+    if(buf[0] == '/'){
+        char *tmp = buf;
+        while(*tmp == '/') tmp++;
+        if(tmp != buf){
+            char *newn = strdup(tmp);
+            free(buf);
+            e->name = newn ? newn : strdup("");
+        } else {
+            e->name = buf;
+        }
+    } else {
+        e->name = buf;
+    }
+    if(cur>=0) fseek(idx->archive_fp, cur, SEEK_SET);
+    return e->name;
+}
+
+static int entry_load_meta(index_t *idx, entry_t *e){
+    if(!e) return 1;
+    if(e->meta_n == 0) return 0;
+    if(e->meta) return 0;
+    if(!idx || !idx->archive_fp) return 1;
+    long cur = ftell(idx->archive_fp);
+    if(fseek(idx->archive_fp, (long)e->meta_off, SEEK_SET) != 0){ if(cur>=0) fseek(idx->archive_fp, cur, SEEK_SET); return 1; }
+    e->meta = calloc(e->meta_n, sizeof(*e->meta));
+    if(!e->meta){ if(cur>=0) fseek(idx->archive_fp, cur, SEEK_SET); return 1; }
+    for(uint32_t m=0;m<e->meta_n;m++){
+        uint16_t klen = read_u16(idx->archive_fp);
+        if(klen){ e->meta[m].key = malloc(klen+1); fread(e->meta[m].key,1,klen,idx->archive_fp); e->meta[m].key[klen]=0; } else e->meta[m].key = NULL;
+        uint16_t vlen = read_u16(idx->archive_fp);
+        if(vlen){ e->meta[m].value = malloc(vlen+1); fread(e->meta[m].value,1,vlen,idx->archive_fp); e->meta[m].value[vlen]=0; } else e->meta[m].value = NULL;
+    }
+    if(cur>=0) fseek(idx->archive_fp, cur, SEEK_SET);
+    return 0;
+}
+
+static void entry_free_meta(entry_t *e){
+    if(!e) return;
+    if(!e->meta) return;
+    for(uint32_t m=0;m<e->meta_n;m++){ free(e->meta[m].key); free(e->meta[m].value); }
+    free(e->meta); e->meta = NULL; e->meta_n = 0;
 }
 
 static int write_index(FILE *f, index_t *idx){
@@ -5622,9 +5721,10 @@ static int write_index(FILE *f, index_t *idx){
     for(uint32_t i=0;i<idx->n;i++){
         entry_t *e = &idx->entries[i];
         write_u32(f, e->id);
-        uint16_t namelen = strlen(e->name);
+        const char *namep = e->name ? e->name : entry_get_name(idx, e);
+        uint16_t namelen = namep ? (uint16_t)strlen(namep) : 0;
         write_u16(f, namelen);
-        fwrite(e->name,1,namelen,f);
+        if(namep && namelen) fwrite(namep,1,namelen,f);
         fputc(e->flags,f);
         fputc(e->comp_level,f);
         write_u64(f, e->data_offset);
@@ -5638,6 +5738,7 @@ static int write_index(FILE *f, index_t *idx){
         write_u64(f, e->mtime);
 
         write_u32(f, e->meta_n);
+        if(e->meta_n && !e->meta && idx) entry_load_meta(idx, e);
         for(uint32_t m=0;m<e->meta_n;m++){
             uint16_t klen = e->meta[m].key ? strlen(e->meta[m].key) : 0;
             uint16_t vlen = e->meta[m].value ? strlen(e->meta[m].value) : 0;
@@ -6681,18 +6782,20 @@ static int list_archive(const char *archive, int json){
         printf("ID  Flags Comp  Size   CSize  Name\n");
         for(uint32_t i=0;i<idx.n;i++){
             entry_t *e = &idx.entries[i];
+            const char *ename = entry_get_name(&idx, e);
             printf("%3u  %02x   %u   %6" PRIu64 "  %6" PRIu64 "  %s\n",
-                e->id, e->flags, e->comp_level, e->uncomp_size, e->comp_size, e->name);
+                e->id, e->flags, e->comp_level, e->uncomp_size, e->comp_size, ename ? ename : "");
         }
     } else {
 
         printf("[");
         for(uint32_t i=0;i<idx.n;i++){
             entry_t *e = &idx.entries[i];
-            char *ename = escape_json_string(e->name);
+            const char *ename = entry_get_name(&idx, e);
+            char *escaped = escape_json_string(ename);
             printf("{\"id\":%u,\"name\":\"%s\",\"flags\":%u,\"comp_level\":%u,\"uncomp_size\":%" PRIu64 ",\"comp_size\":%" PRIu64 ",\"crc32\":%u}",
-                e->id, ename, (unsigned)e->flags, (unsigned)e->comp_level, e->uncomp_size, e->comp_size, e->crc32);
-            free(ename);
+                e->id, escaped ? escaped : "", (unsigned)e->flags, (unsigned)e->comp_level, e->uncomp_size, e->comp_size, e->crc32);
+            if(escaped) free(escaped);
             if(i+1<idx.n) printf(",");
         }
         printf("]\n");
@@ -6710,9 +6813,11 @@ static int search_archive(const char *archive, const char *pattern, int json){
         for(uint32_t i=0;i<idx.n;i++){
             entry_t *e = &idx.entries[i];
             if(e->flags & 4) continue;
-            if(fnmatch(pattern, e->name, 0)==0){
+            const char *ename = entry_get_name(&idx, e);
+            if(!ename) continue;
+            if(fnmatch(pattern, ename, 0)==0){
                 printf("%3u  %02x   %u   %6" PRIu64 "  %6" PRIu64 "  %s\n",
-                    e->id, e->flags, e->comp_level, e->uncomp_size, e->comp_size, e->name);
+                    e->id, e->flags, e->comp_level, e->uncomp_size, e->comp_size, ename ? ename : "");
             }
         }
     } else {
@@ -6721,13 +6826,15 @@ static int search_archive(const char *archive, const char *pattern, int json){
         for(uint32_t i=0;i<idx.n;i++){
             entry_t *e = &idx.entries[i];
             if(e->flags & 4) continue;
-            if(fnmatch(pattern, e->name, 0)==0){
+            const char *ename = entry_get_name(&idx, e);
+            if(!ename) continue;
+            if(fnmatch(pattern, ename, 0)==0){
                 if(!first) printf(",");
                 first = 0;
-                char *ename = escape_json_string(e->name);
+                char *escaped = escape_json_string(ename);
                 printf("{\"id\":%u,\"name\":\"%s\",\"flags\":%u,\"comp_level\":%u,\"uncomp_size\":%" PRIu64 ",\"comp_size\":%" PRIu64 ",\"crc32\":%u}",
-                    e->id, ename, (unsigned)e->flags, (unsigned)e->comp_level, e->uncomp_size, e->comp_size, e->crc32);
-                free(ename);
+                    e->id, escaped ? escaped : "", (unsigned)e->flags, (unsigned)e->comp_level, e->uncomp_size, e->comp_size, e->crc32);
+                if(escaped) free(escaped);
             }
         }
         printf("]\n");
@@ -6978,7 +7085,7 @@ static int rebuild_archive(const char *archive, const uint32_t *exclude_ids, uin
         if(!quiet){
             if(total_to_copy>0){ unsigned int prog = (unsigned int)(total_copied * 100ULL / total_to_copy);
                 if(global_verbose) fprintf(stderr, "(%u%%)\n", prog);
-                else { char bn[PATH_MAX]; compact_basename(e->name, bn, sizeof(bn)); fprintf(stderr, "\rRebuilding: %s (%u%%)\x1b[K", bn, prog); fflush(stderr); }
+                else { char bn[PATH_MAX]; const char *ename = entry_get_name(&idx, e); compact_basename(ename ? ename : "", bn, sizeof(bn)); fprintf(stderr, "\rRebuilding: %s (%u%%)\x1b[K", bn, prog); fflush(stderr); }
             }
             else { if(global_verbose) fprintf(stderr, "\n"); else { fprintf(stderr, "\r"); fflush(stderr); } }
         }
@@ -6988,7 +7095,8 @@ static int rebuild_archive(const char *archive, const uint32_t *exclude_ids, uin
         entry_t *ne = &newidx.entries[newidx.n];
         memset(ne,0,sizeof(*ne));
         ne->id = e->id;
-        ne->name = strdup(e->name);
+        const char *ename = entry_get_name(&idx, e);
+        ne->name = strdup(ename ? ename : "");
         ne->flags = e->flags;
         ne->comp_level = e->comp_level;
         ne->data_offset = off;
@@ -7002,6 +7110,7 @@ static int rebuild_archive(const char *archive, const uint32_t *exclude_ids, uin
         ne->mtime = e->mtime;
         ne->meta_n = e->meta_n;
         if(e->meta_n){
+            if(!e->meta) entry_load_meta(&idx, e);
             ne->meta = calloc(e->meta_n, sizeof(*ne->meta));
             for(uint32_t m=0;m<e->meta_n;m++){ ne->meta[m].key = e->meta[m].key ? strdup(e->meta[m].key) : NULL; ne->meta[m].value = e->meta[m].value ? strdup(e->meta[m].value) : NULL; }
         } else ne->meta = NULL;
@@ -7085,7 +7194,8 @@ static int compress_archive(const char *archive, int target_clevel, const char *
         newidx.entries = realloc(newidx.entries, sizeof(entry_t)*(newidx.n+1));
         entry_t *ne = &newidx.entries[newidx.n]; memset(ne,0,sizeof(*ne));
         ne->id = e->id;
-        ne->name = strdup(e->name);
+        const char *ename = entry_get_name(&idx, e);
+        ne->name = strdup(ename ? ename : "");
         ne->flags = (final_comp?1:0) | ((e->flags & 2)?2:0);
         ne->comp_level = final_comp ? target_clevel : 0;
         ne->data_offset = off;
@@ -7102,12 +7212,17 @@ static int compress_archive(const char *archive, int target_clevel, const char *
         ne->crc32 = crc;
 
     ne->mode = e->mode; ne->uid = e->uid; ne->gid = e->gid; ne->mtime = e->mtime;
-    ne->meta_n = e->meta_n; if(e->meta_n){ ne->meta = calloc(e->meta_n, sizeof(*ne->meta)); for(uint32_t m=0;m<e->meta_n;m++){ ne->meta[m].key = e->meta[m].key?strdup(e->meta[m].key):NULL; ne->meta[m].value = e->meta[m].value?strdup(e->meta[m].value):NULL; } } else ne->meta = NULL;
+    ne->meta_n = e->meta_n;
+    if(e->meta_n){
+        if(!e->meta) entry_load_meta(&idx, e);
+        ne->meta = calloc(e->meta_n, sizeof(*ne->meta));
+        for(uint32_t m=0;m<e->meta_n;m++){ ne->meta[m].key = e->meta[m].key?strdup(e->meta[m].key):NULL; ne->meta[m].value = e->meta[m].value?strdup(e->meta[m].value):NULL; }
+    } else ne->meta = NULL;
         newidx.n++; if(ne->id >= newidx.next_id) newidx.next_id = ne->id+1;
         processed_entries++;
         if(!global_quiet){ unsigned int prog = 0; if(total_entries>0) prog = (unsigned int)(processed_entries * 100ULL / total_entries);
-            if(global_verbose) fprintf(stderr, "Recompressing id %u %s (%u%%)\n", e->id, e->name, prog);
-            else { char bn[PATH_MAX]; compact_basename(e->name, bn, sizeof(bn)); fprintf(stderr, "\rCompressing: %s (%u%%)", bn, prog); fflush(stderr); }
+            if(global_verbose) fprintf(stderr, "Recompressing id %u %s (%u%%)\n", e->id, ename ? ename : "", prog);
+            else { char bn[PATH_MAX]; compact_basename(ename ? ename : "", bn, sizeof(bn)); fprintf(stderr, "\rCompressing: %s (%u%%)", bn, prog); fflush(stderr); }
         }
 
         if(!(e->flags & 2) && !(final_blob==blob)) free(blob);
@@ -7553,7 +7668,8 @@ int main(int argc, char **argv){
         index_t idx = load_index(f);
 
         for(uint32_t i=0;i<idx.n;i++){
-            if(strcmp(idx.entries[i].name, dname)==0 && !(idx.entries[i].flags & 4)){
+            const char *ename = entry_get_name(&idx, &idx.entries[i]);
+            if(ename && strcmp(ename, dname)==0 && !(idx.entries[i].flags & 4)){
                 fprintf(stderr, "Directory already exists in archive: %s\n", dname);
                 free_index(&idx); fclose(f); return 1;
             }
