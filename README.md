@@ -38,6 +38,7 @@ The CLI supports the following subcommands and options (exact behavior implement
         - `--mirror` (or `-m`): Mirror mode. In addition to incremental behavior, any files present in the archive but missing from the source are marked as deleted (logical removal). The archive becomes a mirror of the source directory.
         - You can combine both options: `--incremental --mirror` (or `-i -m`). Mirror mode always implies incremental behavior.
         - `--ignore <pattern>`: Skip files, directories, or archive paths matching the provided shell-style glob. You can repeat this option multiple times.
+        - `--devdir <name|path>`: Treat matching source roots as pseudo device directories (for example Wine `dosdevices`). Only the immediate entries (device links, drive letters) are archived, preventing recursion into the mounted targets. You can repeat this flag to register multiple names or absolute paths. By default, any source path containing `/dosdevices` is treated this way even without the flag.
         - Files that cannot be read (for example due to missing permissions) are reported and left untouched.
 
 #### Examples for incremental and mirror modes

@@ -15,13 +15,13 @@
 #endif
 #define _GNU_SOURCE
 #include "la_bridge.h"
-#define BAAR_HEADER "BAAR v0.28, \xC2\xA9 BArko, 2025"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <dirent.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/wait.h>
@@ -169,6 +169,112 @@ bool la_is_supported(const char *path) {
 
     archive_read_free(a);
     return supported;
+}
+
+/* Add a path recursively into archive 'out'. If dst_prefix is provided,
+   archive paths will be prefixed by dst_prefix; otherwise, entries will
+   use the original path with leading slashes stripped. */
+static int la_add_path_recursive(struct archive *out, const char *src_root, const char *src_path, const char *dst_prefix, int verbose) {
+    struct stat st;
+    if (lstat(src_path, &st) != 0) {
+        if (verbose) fprintf(stderr, "Warning: cannot stat %s: %s\n", src_path, strerror(errno));
+        return 1;
+    }
+
+    char archive_name[PATH_MAX];
+    const char *computed_name = NULL;
+    if (dst_prefix && dst_prefix[0]) {
+        /* compute relative path to src_root */
+        size_t rootlen = strlen(src_root);
+        const char *rel = src_path;
+        if (rootlen > 0 && strncmp(src_path, src_root, rootlen) == 0) {
+            rel = src_path + rootlen;
+            if (*rel == '/') rel++;
+        } else {
+            /* not under root, use basename */
+            const char *bn = strrchr(src_path, '/');
+            rel = bn ? bn + 1 : src_path;
+        }
+        if (dst_prefix[0] != '\0') snprintf(archive_name, sizeof(archive_name), "%s/%s", dst_prefix, rel);
+        else snprintf(archive_name, sizeof(archive_name), "%s", rel);
+        computed_name = archive_name;
+    } else {
+        /* use full path with leading slashes stripped */
+        const char *s = src_path;
+        while (*s == '/') s++;
+        snprintf(archive_name, sizeof(archive_name), "%s", s);
+        computed_name = archive_name;
+    }
+
+    struct archive_entry *entry = archive_entry_new();
+    archive_entry_copy_stat(entry, &st);
+    archive_entry_set_pathname(entry, computed_name);
+
+    if (S_ISDIR(st.st_mode)) {
+        /* ensure trailing slash for directory in some formats */
+        archive_entry_set_filetype(entry, AE_IFDIR);
+        archive_entry_set_size(entry, 0);
+        int r = archive_write_header(out, entry);
+        if (r != ARCHIVE_OK && r != ARCHIVE_WARN) {
+            fprintf(stderr, "Warning: could not write header for directory %s: %s\n", src_path, archive_error_string(out));
+            archive_entry_free(entry);
+            return 1;
+        }
+        archive_write_finish_entry(out);
+        archive_entry_free(entry);
+
+        DIR *dir = opendir(src_path);
+        if (!dir) return 0;
+        struct dirent *ent;
+        while ((ent = readdir(dir)) != NULL) {
+            if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+            char child[PATH_MAX];
+            snprintf(child, sizeof(child), "%s/%s", src_path, ent->d_name);
+            la_add_path_recursive(out, src_root, child, dst_prefix, verbose);
+        }
+        closedir(dir);
+        return 0;
+    }
+
+    if (S_ISREG(st.st_mode)) {
+        int r = archive_write_header(out, entry);
+        if (r != ARCHIVE_OK) {
+            fprintf(stderr, "Error writing header for %s: %s\n", src_path, archive_error_string(out));
+            archive_entry_free(entry);
+            return 1;
+        }
+
+        int fd = open(src_path, O_RDONLY);
+        if (fd < 0) {
+            fprintf(stderr, "Error opening %s: %s\n", src_path, strerror(errno));
+            archive_entry_free(entry);
+            return 1;
+        }
+        char buff[8192];
+        ssize_t len;
+        while ((len = read(fd, buff, sizeof(buff))) > 0) {
+            if (archive_write_data(out, buff, len) < 0) {
+                fprintf(stderr, "Error writing data for %s: %s\n", src_path, archive_error_string(out));
+                close(fd);
+                archive_entry_free(entry);
+                return 1;
+            }
+        }
+        close(fd);
+        archive_write_finish_entry(out);
+        archive_entry_free(entry);
+        return 0;
+    }
+
+    /* symlink and other types: copy as header (we don't add contents) */
+    int r = archive_write_header(out, entry);
+    if (r != ARCHIVE_OK) {
+        fprintf(stderr, "Warning: could not write header for %s: %s\n", src_path, archive_error_string(out));
+    } else {
+        archive_write_finish_entry(out);
+    }
+    archive_entry_free(entry);
+    return 0;
 }
 
 
@@ -652,14 +758,32 @@ int la_add_files(const char *archive_path, const char **file_paths,
     if (ext && strcmp(ext, ".zip") == 0 && password && password[0]) {
 
         char **argv = malloc(sizeof(char*) * (file_count + 7));
+        char **allocated = malloc(sizeof(char*) * file_count);
+        int allocated_count = 0;
         int ai = 0;
         argv[ai++] = "zip";
         argv[ai++] = "-P";
         argv[ai++] = (char*)password;
         if (!verbose) argv[ai++] = "-q";
-        argv[ai++] = "-j";
         argv[ai++] = (char*)archive_path;
-        for (int i = 0; i < file_count; i++) argv[ai++] = (char*)file_paths[i];
+        for (int i = 0; i < file_count; i++) {
+            const char *fp = file_paths[i];
+            const char *last_colon = strrchr(fp, ':');
+            if (last_colon && last_colon > fp) {
+                size_t slen = (size_t)(last_colon - fp);
+                if (slen > 0 && slen < PATH_MAX) {
+                    char srcbuf[PATH_MAX];
+                    memcpy(srcbuf, fp, slen);
+                    srcbuf[slen] = '\0';
+                    argv[ai++] = strdup(srcbuf);
+                    if (argv[ai-1]) allocated[allocated_count++] = argv[ai-1];
+                } else {
+                    argv[ai++] = (char*)fp;
+                }
+            } else {
+                argv[ai++] = (char*)fp;
+            }
+        }
         argv[ai] = NULL;
 
         pid_t pid = fork();
@@ -670,10 +794,14 @@ int la_add_files(const char *archive_path, const char **file_paths,
         } else if (pid > 0) {
             int status = 0;
             waitpid(pid, &status, 0);
+            for (int ai2 = 0; ai2 < allocated_count; ai2++) free(allocated[ai2]);
+            free(allocated);
             free(argv);
             if (WIFEXITED(status) && WEXITSTATUS(status) == 0) return 0;
             return 1;
         } else {
+            for (int ai2 = 0; ai2 < allocated_count; ai2++) free(allocated[ai2]);
+            free(allocated);
             free(argv);
             return 1;
         }
@@ -797,40 +925,63 @@ int la_add_files(const char *archive_path, const char **file_paths,
 
 
     if (!verbose && file_count > 0) {
-        fprintf(stderr, "%s\n", BAAR_HEADER);
+        fprintf(stderr, "%s\n", baar_header_string());
         fprintf(stderr, "Adding %d files: ", file_count);
         fflush(stderr);
     }
 
     for (int i = 0; i < file_count; i++) {
         const char *file_path = file_paths[i];
+        char src_path_buf[PATH_MAX];
+        char dst_path_buf[PATH_MAX];
+        const char *src_path = file_path;
+        const char *dst_path = NULL;
+        const char *last_colon = strrchr(file_path, ':');
+        if (last_colon && last_colon > file_path) {
+            size_t slen = (size_t)(last_colon - file_path);
+            if (slen < sizeof(src_path_buf)) {
+                memcpy(src_path_buf, file_path, slen);
+                src_path_buf[slen] = '\0';
+                src_path = src_path_buf;
+                strncpy(dst_path_buf, last_colon + 1, sizeof(dst_path_buf) - 1);
+                dst_path_buf[sizeof(dst_path_buf) - 1] = '\0';
+                dst_path = dst_path_buf;
+            }
+        }
 
         struct stat st;
-        if (stat(file_path, &st) != 0) {
-            fprintf(stderr, "Warning: cannot stat %s: %s\n", file_path, strerror(errno));
+        if (stat(src_path, &st) != 0) {
+            fprintf(stderr, "Warning: cannot stat %s: %s\n", src_path, strerror(errno));
+            continue;
+        }
+
+        if (S_ISDIR(st.st_mode)) {
+            /* Recursively add directory contents; map to dst_path (prefix) if provided */
+            if (la_add_path_recursive(out, src_path, src_path, dst_path, verbose) != 0) {
+                fprintf(stderr, "Warning: failed to add directory %s\n", src_path);
+            }
             continue;
         }
 
         struct archive_entry *entry = archive_entry_new();
         archive_entry_copy_stat(entry, &st);
 
-        const char *entry_name = strrchr(file_path, '/');
-        entry_name = entry_name ? entry_name + 1 : file_path;
-        archive_entry_set_pathname(entry, entry_name);
+        const char *entry_name = dst_path ? dst_path : strip_leading_slashes(src_path);
+        archive_entry_set_pathname(entry, entry_name ? entry_name : src_path);
 
         r = archive_write_header(out, entry);
         if (r != ARCHIVE_OK) {
-            fprintf(stderr, "Error writing header for %s: %s\n",
-                    file_path, archive_error_string(out));
+                fprintf(stderr, "Error writing header for %s: %s\n",
+                    src_path, archive_error_string(out));
             archive_entry_free(entry);
             continue;
         }
 
 
         if (S_ISREG(st.st_mode)) {
-            int fd = open(file_path, O_RDONLY);
+            int fd = open(src_path, O_RDONLY);
             if (fd < 0) {
-                fprintf(stderr, "Error opening %s: %s\n", file_path, strerror(errno));
+                fprintf(stderr, "Error opening %s: %s\n", src_path, strerror(errno));
                 archive_entry_free(entry);
                 continue;
             }
@@ -842,10 +993,10 @@ int la_add_files(const char *archive_path, const char **file_paths,
             }
 
             close(fd);
-            if (verbose) fprintf(stderr, "  Added: %s\n", file_path);
+            if (verbose) fprintf(stderr, "  Added: %s\n", src_path);
             else {
-                const char *base_name = strrchr(file_path, '/');
-                base_name = base_name ? base_name + 1 : file_path;
+                const char *base_name = strrchr(src_path, '/');
+                base_name = base_name ? base_name + 1 : src_path;
                 unsigned int perc = (unsigned int)((i + 1) * 100 / (file_count > 0 ? file_count : 1));
                 fprintf(stderr, "\rAdding %d files: %s (%u%%)\x1b[K", file_count, base_name, perc);
                 fflush(stderr);

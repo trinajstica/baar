@@ -1,4 +1,4 @@
-#define BAAR_HEADER "BAAR v0.32, \xC2\xA9 BArko, 2025"
+#define BAAR_HEADER "BAAR v0.36, \xC2\xA9 BArko, 2025"
 
 const char *baar_header_string(void) {
     return BAAR_HEADER;
@@ -16,6 +16,7 @@ const char *baar_header_string(void) {
 #include <unistd.h>
 #include <sys/types.h>
 #include <libgen.h>
+#include <sys/sysmacros.h>
 #include <pthread.h>
 #include <time.h>
 #include <utime.h>
@@ -132,6 +133,7 @@ static void usage(){
         "      --incremental, -i     Incremental mode: only add new/changed files.\n"
         "      --mirror, -m         Mirror mode: also mark as deleted files missing from source.\n"
         "      --ignore PATTERN     Skip sources or archive paths matching the glob pattern (can be repeated).\n"
+        "      --devdir NAME|PATH   Treat matching sources as pseudo device roots (record immediate entries only). Repeat to add more names.\n"
         "\n"
         "  baar x <archive> [dest_dir] [-p password]\n"
         "    Extract all files from <archive> into dest_dir (current dir if omitted).\n"
@@ -183,6 +185,7 @@ typedef struct {
     char *src_root;
     char *archive_override;
     int clevel;
+    int dev_dir_mode; /* if set, treat the src root as a 'dosdevices' like directory: record immediate children only */
 } add_job_t;
 
 static int add_files_streaming(const char *archive, add_job_t *jobs, int job_count,
@@ -417,6 +420,8 @@ static void populate_list_from_index(void){
                 } else {
                     parent_path = strdup("");
                 }
+                
+                
                 free(tmp);
             }
 
@@ -4863,17 +4868,50 @@ static int is_pseudo_path(const char *path){
     if(!path) return 0;
     // Normalize leading './' and multiple slashes are already normalized earlier
     const char *p = path;
-    // if absolute path use immediate matching
+    /* exact roots */
     if(strncmp(p, "/dev", 4) == 0) return 1;
     if(strncmp(p, "/proc", 5) == 0) return 1;
     if(strncmp(p, "/sys", 4) == 0) return 1;
     if(strncmp(p, "/run", 4) == 0) return 1;
     if(strncmp(p, "/var/run", 8) == 0) return 1;
-    // If path includes "/dev/" as component, skip too (handles dosdevices mapping)
+    /* If path includes "/dev/" as component, skip too (handles dosdevices mapping) */
     if(strstr(p, "/dev/")) return 1;
     if(strstr(p, "/proc/")) return 1;
     if(strstr(p, "/sys/")) return 1;
     return 0;
+}
+
+/* Return true if the path is exactly one of the well-known pseudo roots such as
+   /dev, /proc, /sys, /run or /var/run. This is used to limit recursion depth when
+   adding sources rooted inside these pseudo filesystems (we archive immediate
+   entries but avoid descending deeper). */
+static int is_pseudo_root(const char *path){
+    if(!path) return 0;
+    /* treat '/dev' and other pseudo filesystems as pseudo root prefixes */
+    if(strncmp(path, "/dev", 4) == 0) return 1;
+    if(strncmp(path, "/proc", 5) == 0) return 1;
+    if(strncmp(path, "/sys", 4) == 0) return 1;
+    if(strncmp(path, "/run", 4) == 0) return 1;
+    if(strncmp(path, "/var/run", 8) == 0) return 1;
+    return 0;
+}
+
+/* Return the number of path components under `root` for `path`. If path is the same
+   as root the depth is 0. If path is directly under root (like /dev/ttyS0 and root
+   is /dev) the depth is 1. If the path is outside the root, returns -1. */
+static int path_relative_depth(const char *root, const char *path){
+    if(!root || !path) return -1;
+    size_t rl = strlen(root);
+    if(rl == 0) return -1;
+    if(strncmp(root, path, rl) != 0) return -1;
+    /* If root doesn't end with '/', path must either be exact or have '/' as next char. */
+    if(path[rl] == '\0') return 0;
+    if(path[rl] != '/') return -1;
+    const char *rel = path + rl + 1; /* skip the slash */
+    if(!rel || !rel[0]) return 0;
+    int depth = 1;
+    for(const char *p = rel; *p; p++) if(*p == '/') depth++;
+    return depth;
 }
 
 static void remove_path_recursive(const char *path){
@@ -5203,12 +5241,142 @@ static char *build_child_path(const char *parent, const char *name){
     return out;
 }
 
+static int name_looks_like_device_alias(const char *name){
+    if(!name || !name[0]) return 0;
+    unsigned char c0 = (unsigned char)name[0];
+    unsigned char c1 = (unsigned char)name[1];
+    if(isalpha(c0) && c1 == ':'){
+        return 1;
+    }
+    if(strlen(name) >= 4){
+        unsigned char l0 = (unsigned char)tolower(name[0]);
+        unsigned char l1 = (unsigned char)tolower(name[1]);
+        unsigned char l2 = (unsigned char)tolower(name[2]);
+        if((l0 == 'c' && l1 == 'o' && l2 == 'm') || (l0 == 'l' && l1 == 'p' && l2 == 't')){
+            int digits = 1;
+            for(size_t i=3; name[i]; i++){
+                if(!isdigit((unsigned char)name[i])){
+                    digits = 0;
+                    break;
+                }
+            }
+            if(digits) return 1;
+        }
+    }
+    return 0;
+}
+
+static int looks_like_device_directory(const char *path){
+    if(!path) return 0;
+    DIR *dir = opendir(path);
+    if(!dir) return 0;
+    int result = 0;
+    struct dirent *ent;
+    while((ent = readdir(dir))){
+        if(strcmp(ent->d_name, ".")==0 || strcmp(ent->d_name, "..") == 0) continue;
+        char *child = build_child_path(path, ent->d_name);
+        if(!child){
+            break;
+        }
+        struct stat st;
+        if(lstat(child, &st)==0){
+            if(S_ISCHR(st.st_mode) || S_ISBLK(st.st_mode) || S_ISFIFO(st.st_mode)){
+                result = 1;
+            } else if(S_ISLNK(st.st_mode)){
+                char target[PATH_MAX+1];
+                ssize_t lr = readlink(child, target, PATH_MAX);
+                if(lr > 0){
+                    target[lr] = '\0';
+                    if(is_pseudo_path(target) || strncmp(target, "/run", 4) == 0 || strncmp(target, "/var/run", 8) == 0){
+                        result = 1;
+                    } else if(name_looks_like_device_alias(ent->d_name)){
+                        result = 1;
+                    }
+                } else if(name_looks_like_device_alias(ent->d_name)){
+                    result = 1;
+                }
+            } else if(name_looks_like_device_alias(ent->d_name)){
+                result = 1;
+            }
+        } else if(name_looks_like_device_alias(ent->d_name)){
+            result = 1;
+        }
+        free(child);
+        break;
+    }
+    closedir(dir);
+    return result;
+}
+
+static int register_devdir_root(char ***roots, size_t *count, const char *path){
+    if(!roots || !count || !path) return -1;
+    char *norm = normalize_path_basic(path);
+    if(!norm) return -1;
+    for(size_t i=0;i<*count;i++){
+        if(strcmp((*roots)[i], norm) == 0){
+            free(norm);
+            return 0;
+        }
+    }
+    char **tmp = realloc(*roots, sizeof(char*) * (*count + 1));
+    if(!tmp){
+        free(norm);
+        return -1;
+    }
+    *roots = tmp;
+    (*roots)[*count] = norm;
+    (*count)++;
+    return 0;
+}
+
+static void free_devdir_roots(char **roots, size_t count){
+    if(!roots) return;
+    for(size_t i=0;i<count;i++){
+        free(roots[i]);
+    }
+    free(roots);
+}
+
+static int find_devdir_root(char **roots, size_t count, const char *path, int *depth_out){
+    if(!roots || count == 0 || !path) return -1;
+    for(size_t i=0;i<count;i++){
+        int depth = path_relative_depth(roots[i], path);
+        if(depth >= 0){
+            if(depth_out) *depth_out = depth;
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
 static char *resolve_archive_path(const add_job_t *job, const char *src_path){
     if(!job || !src_path) return NULL;
+    char *norm_src = normalize_path_basic(src_path);
+    if(!norm_src) return NULL;
     if(job->archive_override){
-        return strdup(job->archive_override);
+        const char *rel = norm_src;
+        size_t root_len = job->src_root ? strlen(job->src_root) : 0;
+        if(root_len > 0 && strncmp(job->src_root, norm_src, root_len) == 0){
+            const char *p = norm_src + root_len;
+            if(*p == '/') p++;
+            rel = p;
+        }
+        size_t override_len = strlen(job->archive_override);
+        size_t rel_len = rel ? strlen(rel) : 0;
+        int append_rel = (rel_len > 0);
+        int need_slash = append_rel && override_len > 0 && job->archive_override[override_len-1] != '/';
+        size_t total = override_len + (need_slash ? 1 : 0) + rel_len + 1;
+        char *out = malloc(total);
+        if(!out){ free(norm_src); return NULL; }
+        size_t pos = 0;
+        if(override_len){ memcpy(out + pos, job->archive_override, override_len); pos += override_len; }
+        if(need_slash){ out[pos++] = '/'; }
+        if(append_rel && rel_len){ memcpy(out + pos, rel, rel_len); pos += rel_len; }
+        out[pos] = '\0';
+        free(norm_src);
+        return out;
     }
-    return normalize_path_basic(src_path);
+    return norm_src;
 }
 
 static void mark_entry_deleted_flag(index_t *idx, uint32_t id){
@@ -5692,6 +5860,15 @@ static const char *entry_get_name(index_t *idx, entry_t *e){
     }
     if(cur>=0) fseek(idx->archive_fp, cur, SEEK_SET);
     return e->name;
+}
+
+static int entry_is_effectively_compressed(const entry_t *e){
+    if(!e) return 0;
+    if(e->flags & 1) return 1;
+    if(e->uncomp_size == 0) return 0;
+    if(e->comp_size > 0 && e->comp_size < e->uncomp_size) return 1;
+    if(e->comp_level > 0 && e->comp_size > 0) return 1;
+    return 0;
 }
 
 static int entry_load_meta(index_t *idx, entry_t *e){
@@ -6212,13 +6389,13 @@ static int add_files(const char *archive, filepair_t *filepairs, int *clevels, i
             memset(e,0,sizeof(*e));
             e->id = idx.next_id++;
             e->name = strdup(archive_path);
-            e->flags = (compressed?1:0) | ((pwd&&pwd[0])?2:0);
-            e->comp_level = compressed ? clevel : 0;
             e->data_offset = data_offset;
             e->comp_size = final_sz;
             e->uncomp_size = fsize;
             e->crc32 = crc;
             idx.n++;
+            e->flags = (compressed?1:0) | ((pwd&&pwd[0])?2:0);
+            e->comp_level = compressed ? clevel : 0;
 
             e->mode = (uint32_t)(plan->st.st_mode & 07777);
             e->uid = (uint32_t)plan->st.st_uid;
@@ -6272,10 +6449,13 @@ static int process_single_file(add_stream_ctx_t *ctx,
         return 1;
     }
     if(g_abort_requested) return 1;
-    // Skip pseudo files and special device-like files.
-    if(!st || !S_ISREG(st->st_mode) || is_pseudo_path(src_path) || (archive_path && is_pseudo_path(archive_path))){
+    /* Only skip if stat failed. We allow regular files and a subset of special
+       types (symlinks, char/block devices, fifos). Further filtering based on
+       pseudo-roots and ignore patterns is handled by walk_job_tree. */
+    if(!st) return 1;
+    if(!(S_ISREG(st->st_mode) || S_ISLNK(st->st_mode) || S_ISCHR(st->st_mode) || S_ISBLK(st->st_mode) || S_ISFIFO(st->st_mode) || S_ISDIR(st->st_mode))){
         if(!global_quiet){
-            fprintf(stderr, "Skipping special file or pseudo path: %s\n", src_path);
+            fprintf(stderr, "Skipping unsupported file type: %s\n", src_path);
         }
         return 0;
     }
@@ -6323,8 +6503,12 @@ static int process_single_file(add_stream_ctx_t *ctx,
         return 1;
     }
     size_t fsize = (size_t)file_sz64;
-
+    /* Adjust handling for special types: symlink, directory, device nodes and FIFO -- these are header-only. */
+    if(S_ISLNK(st->st_mode) || S_ISDIR(st->st_mode) || S_ISCHR(st->st_mode) || S_ISBLK(st->st_mode) || S_ISFIFO(st->st_mode)){
+        fsize = 0;
+    }
     int streaming_mode = (fsize > BAAR_STREAM_THRESHOLD);
+    /* debug output removed for production */
     unsigned char *buf = NULL;
     unsigned char *out = NULL;
     size_t final_sz = 0;
@@ -6336,6 +6520,15 @@ static int process_single_file(add_stream_ctx_t *ctx,
             streaming_mode = 1;
         }
     }
+    /* For symlink and directory special handling: if it's a symlink, we store target as metadata rather than raw content.
+       For directories, and device nodes/fifos, we do not store content. */
+    /* If symlink, read target so we can record it in meta; if it's missing, we'll still
+       record the symlink entry where appropriate. fsize already forced to 0 earlier. */
+    if(S_ISLNK(st->st_mode)){
+        char ltarget[PATH_MAX+1]; ssize_t lr = readlink(src_path, ltarget, PATH_MAX);
+        if(lr >= 0){ ltarget[lr] = '\0'; }
+    }
+    /* Symlink targets stored in metadata instead of file content; already read above. */
 
     volatile int spinner_run = 1;
     spinner_arg_t *sarg = NULL;
@@ -6383,8 +6576,6 @@ static int process_single_file(add_stream_ctx_t *ctx,
     memset(e,0,sizeof(*e));
     e->id = ctx->idx->next_id++;
     e->name = archive_name;
-    e->flags = (compressed ? 1 : 0) | ((ctx->pwd && ctx->pwd[0]) ? 2 : 0);
-    e->comp_level = compressed ? clevel : 0;
 
     fseek(ctx->archive_fp, 0, SEEK_END);
     uint64_t data_offset = ftell(ctx->archive_fp);
@@ -6399,6 +6590,7 @@ static int process_single_file(add_stream_ctx_t *ctx,
                 return 1;
             }
         } else {
+            /* debug output removed for production */
             FILE *in = fopen(src_path, "rb");
             if(!in){
                 if(spinner_created){ spinner_run = 0; pthread_join(spinner_thread, NULL); }
@@ -6456,6 +6648,8 @@ static int process_single_file(add_stream_ctx_t *ctx,
         }
     }
 
+    e->flags = (compressed ? 1 : 0) | ((ctx->pwd && ctx->pwd[0]) ? 2 : 0);
+    e->comp_level = compressed ? clevel : 0;
     e->data_offset = data_offset;
     e->comp_size = final_sz;
     e->uncomp_size = fsize;
@@ -6465,6 +6659,51 @@ static int process_single_file(add_stream_ctx_t *ctx,
     e->gid = (uint32_t)st->st_gid;
     e->mtime = (uint64_t)st->st_mtime;
     ctx->idx->n++;
+    /* If this is a directory, mark with a trailing slash in the stored name to be consistent with mkdir-like entries. */
+    if(S_ISDIR(st->st_mode)){
+        size_t nl = strlen(e->name);
+        if(nl == 0 || e->name[nl-1] != '/'){
+            char *tmp = malloc(nl + 2);
+            if(tmp){ memcpy(tmp, e->name, nl); tmp[nl] = '/'; tmp[nl+1] = '\0'; free(e->name); e->name = tmp; }
+        }
+    }
+
+     /* If this was a device node (char/block) or FIFO, add metadata describing the device
+       numbers so extractors can recreate them if needed. */
+     if(S_ISCHR(st->st_mode) || S_ISBLK(st->st_mode)){
+        unsigned int maj = major(st->st_rdev);
+        unsigned int min = minor(st->st_rdev);
+        char majbuf[32]; char minbuf[32];
+        snprintf(majbuf, sizeof(majbuf), "%u", maj);
+        snprintf(minbuf, sizeof(minbuf), "%u", min);
+        e->meta_n = 2;
+        e->meta = calloc(e->meta_n, sizeof(*e->meta));
+        if(e->meta){
+            e->meta[0].key = strdup("BAAR_DEV_MAJOR"); e->meta[0].value = strdup(majbuf);
+            e->meta[1].key = strdup("BAAR_DEV_MINOR"); e->meta[1].value = strdup(minbuf);
+        }
+        /* record the device type so extractor can create the right node */
+        e->meta_n += 1;
+        e->meta = realloc(e->meta, sizeof(*e->meta) * e->meta_n);
+        if(e->meta){
+            e->meta[2].key = strdup("BAAR_TYPE"); e->meta[2].value = strdup(S_ISCHR(st->st_mode) ? "CHARDEV" : "BLKDEV");
+        }
+    } else if(S_ISFIFO(st->st_mode)){
+        e->meta_n = 1;
+        e->meta = calloc(1, sizeof(*e->meta));
+        if(e->meta){ e->meta[0].key = strdup("BAAR_TYPE"); e->meta[0].value = strdup("FIFO"); }
+    } else if(S_ISLNK(st->st_mode)){
+        /* store that this entry originally was a symlink so extractors can know,
+           and store the symlink target if available in metadata. */
+        e->meta_n = 1;
+        e->meta = calloc(1, sizeof(*e->meta));
+        if(e->meta){ e->meta[0].key = strdup("BAAR_TYPE"); e->meta[0].value = strdup("SYMLINK"); }
+        char ltarget[PATH_MAX+1]; ssize_t lr = readlink(src_path, ltarget, PATH_MAX);
+        if(lr >= 0){ ltarget[lr] = '\0'; /* add another meta key for target */
+            e->meta_n = 2; e->meta = realloc(e->meta, sizeof(*e->meta) * 2);
+            if(e->meta){ e->meta[1].key = strdup("BAAR_SYMLINK_TARGET"); e->meta[1].value = strdup(ltarget); }
+        }
+    }
 
     spinner_run = 0;
     if(spinner_created){ pthread_join(spinner_thread, NULL); }
@@ -6488,7 +6727,9 @@ static int process_single_file(add_stream_ctx_t *ctx,
 
     if(out) free(out);
     if(buf) free(buf);
-    if(!global_quiet && !global_verbose) fprintf(stderr, "\n");
+    if(!global_quiet && !global_verbose){ fprintf(stderr, "\r\n"); fflush(stderr); }
+    /* Debug marker to ensure this path executes */
+    /* end of extract progress output */
     return 0;
 }
 
@@ -6504,7 +6745,34 @@ static int walk_job_tree(add_stream_ctx_t *ctx, const add_job_t *job){
         free(root_archive);
     }
 
+    /* resolve the root path to prevent following symlinks outside of the archive root */
+    char resolved_root_buf[PATH_MAX+1];
+    char *resolved_root = realpath(job->src_root, resolved_root_buf);
+    if(!resolved_root){
+        strncpy(resolved_root_buf, job->src_root, sizeof(resolved_root_buf)-1);
+        resolved_root_buf[sizeof(resolved_root_buf)-1] = '\0';
+        resolved_root = resolved_root_buf;
+    }
+
+    /* Decide whether this job is rooted inside a pseudo filesystem; if so, limit
+       recursion to immediate children only (depth == 1). */
+    int limit_depth = -1;
+    if(job->src_root && is_pseudo_root(job->src_root)){
+        limit_depth = 1;
+    }
+    int dev_dir_mode = job->dev_dir_mode ? 1 : 0;
+    char **devdir_roots = NULL;
+    size_t devdir_root_count = 0;
+    if(dev_dir_mode){
+        register_devdir_root(&devdir_roots, &devdir_root_count, job->src_root);
+    } else if(looks_like_device_directory(job->src_root)){
+        if(register_devdir_root(&devdir_roots, &devdir_root_count, job->src_root) == 0){
+            dev_dir_mode = 1;
+        }
+    }
+
     path_stack_t stack = {0};
+    /* dev_dir_mode indicates special handling for 'dosdevices' like directories; debug print removed */
     if(path_stack_push(&stack, job->src_root) != 0){
         fprintf(stderr, "Out of memory while scheduling %s\n", job->src_root);
         path_stack_free(&stack);
@@ -6520,7 +6788,8 @@ static int walk_job_tree(add_stream_ctx_t *ctx, const add_job_t *job){
         char *current = path_stack_pop(&stack);
         if(!current) break;
         struct stat st;
-        if(stat(current, &st)!=0){
+        /* Use lstat here so we can detect symlinks and avoid following them by default */
+        if(lstat(current, &st)!=0){
             fprintf(stderr, "Skipping %s: %s\n", current, strerror(errno));
             free(current);
             continue;
@@ -6552,17 +6821,131 @@ static int walk_job_tree(add_stream_ctx_t *ctx, const add_job_t *job){
                     break;
                 }
                 struct stat child_st;
-                if(stat(child, &child_st)!=0){
+                if(lstat(child, &child_st)!=0){
                     fprintf(stderr, "Skipping %s: %s\n", child, strerror(errno));
                     free(child);
                     continue;
+                }
+                if(S_ISLNK(child_st.st_mode)){
+                    int devdir_depth = -1;
+                    int devdir_match = find_devdir_root(devdir_roots, devdir_root_count, child, &devdir_depth);
+                    if(devdir_match >= 0){
+                        if(devdir_depth != 1){
+                            free(child);
+                            continue;
+                        }
+                        char *archive_path = resolve_archive_path(job, child);
+                        if(archive_path){
+                            if(!should_ignore_path(child, archive_path, ctx->ignore_patterns, ctx->ignore_count)){
+                                if(process_single_file(ctx, child, archive_path, job->clevel, &child_st) != 0){
+                                    free(archive_path);
+                                    free(child);
+                                    status = 1;
+                                    break;
+                                }
+                            }
+                            free(archive_path);
+                        }
+                        free(child);
+                        continue;
+                    }
+                    /* If the symlink points outside the archive root or points to device/mount targets like /dev /proc /run /sys /run/media, skip it. */
+                    char link_target[PATH_MAX+1];
+                    ssize_t r = readlink(child, link_target, PATH_MAX);
+                    if(r > 0){ link_target[r] = '\0';
+                        char *resolved = realpath(child, NULL);
+                        if(resolved){
+                                /* Skip if it points to /proc /sys or outside the initial job->src_root. Symlinks
+                                   pointing to /dev or /run and their immediate children are allowed only if depth limit permits. */
+                                int skip_link = 0;
+                                if(strncmp(resolved, "/proc", 5) == 0 || strncmp(resolved, "/sys", 4) == 0) skip_link = 1;
+                                if((strncmp(resolved, "/dev", 4) == 0 || strncmp(resolved, "/run", 4) == 0 || strncmp(resolved, "/var/run", 8) == 0)){
+                                    if(limit_depth < 0 || path_relative_depth(job->src_root, resolved) > limit_depth){
+                                        skip_link = 1;
+                                    }
+                                }
+                            /* If resolved path is not under the source root, skip to avoid following out-of-tree links */
+                            if(!skip_link){
+                                size_t root_len = strlen(resolved_root);
+                                if(strncmp(resolved, resolved_root, root_len) != 0 || (resolved[root_len] != '/' && resolved[root_len] != '\0')){
+                                    skip_link = 1;
+                                }
+                            }
+                                    if(skip_link){
+                                        if(!global_quiet) fprintf(stderr, "Skipping symlink (external or device) %s -> %s\n", child, resolved);
+                                        free(resolved);
+                                        free(child);
+                                        continue;
+                                    }
+                                    /* Allowed symlink: record it as a header-only entry */
+                                    {
+                                        char *archive_path = resolve_archive_path(job, child);
+                                        if(archive_path){
+                                            if(!should_ignore_path(child, archive_path, ctx->ignore_patterns, ctx->ignore_count)){
+                                                if(process_single_file(ctx, child, archive_path, job->clevel, &child_st) != 0){
+                                                    free(archive_path);
+                                                    free(resolved);
+                                                    free(child);
+                                                    status = 1;
+                                                    break;
+                                                }
+                                            }
+                                            free(archive_path);
+                                        }
+                                    }
+                                    free(resolved);
+                        } else {
+                            if(!global_quiet) fprintf(stderr, "Skipping unresolved symlink %s\n", child);
+                            free(child);
+                            continue;
+                        }
+                    } else {
+                        /* invalid symlink; skip */
+                        if(!global_quiet) fprintf(stderr, "Skipping invalid symlink %s\n", child);
+                        free(child);
+                        continue;
+                    }
                 }
                 if(S_ISDIR(child_st.st_mode)){
                     char *dir_archive = resolve_archive_path(job, child);
                     int skip_dir = dir_archive ? should_ignore_path(child, dir_archive, ctx->ignore_patterns, ctx->ignore_count)
                                                : should_ignore_path(child, child, ctx->ignore_patterns, ctx->ignore_count);
                     if(dir_archive) free(dir_archive);
+                    /* If job is limited (under pseudo root), restrict recursion beyond immediate children */
+                    /* If this job is a dosdevices root, only record immediate children as entries
+                       and do not descend into them. If the depth exceeds 1, skip. */
                     if(skip_dir){
+                        free(child);
+                        continue;
+                    }
+                    int devdir_depth = -1;
+                    int devdir_match = find_devdir_root(devdir_roots, devdir_root_count, child, &devdir_depth);
+                    if(devdir_match >= 0 && devdir_depth >= 1){
+                        if(devdir_depth == 1){
+                            char *archive_path = resolve_archive_path(job, child);
+                            if(archive_path){
+                                if(!should_ignore_path(child, archive_path, ctx->ignore_patterns, ctx->ignore_count)){
+                                    if(process_single_file(ctx, child, archive_path, job->clevel, &child_st) != 0){
+                                        free(archive_path);
+                                        free(child);
+                                        status = 1;
+                                        break;
+                                    }
+                                }
+                                free(archive_path);
+                            } else {
+                                free(child);
+                                status = 1;
+                                continue;
+                            }
+                        }
+                        free(child);
+                        continue;
+                    }
+                    if(devdir_match < 0 && looks_like_device_directory(child)){
+                        register_devdir_root(&devdir_roots, &devdir_root_count, child);
+                    }
+                    if(limit_depth >= 0 && path_relative_depth(job->src_root, child) > limit_depth){
                         free(child);
                         continue;
                     }
@@ -6576,9 +6959,22 @@ static int walk_job_tree(add_stream_ctx_t *ctx, const add_job_t *job){
                     continue;
                 }
                 if(S_ISREG(child_st.st_mode)){
-                    // Skip device/pseudo files like /dev, /proc, /sys and special device nodes
-                    if(is_pseudo_path(child)){
-                        if(!global_quiet) fprintf(stderr, "Skipping special/pseudo path: %s\n", child);
+                    int devdir_depth = -1;
+                    int devdir_match = find_devdir_root(devdir_roots, devdir_root_count, child, &devdir_depth);
+                    if(devdir_match < 0 && is_pseudo_path(child)){
+                        if(limit_depth >= 0){
+                            if(path_relative_depth(job->src_root, child) > limit_depth){
+                                if(!global_quiet) fprintf(stderr, "Skipping special/pseudo path (too deep): %s\n", child);
+                                free(child);
+                                continue;
+                            }
+                        } else {
+                            if(!global_quiet) fprintf(stderr, "Skipping special/pseudo path: %s\n", child);
+                            free(child);
+                            continue;
+                        }
+                    }
+                    if(devdir_match >= 0 && devdir_depth != 1){
                         free(child);
                         continue;
                     }
@@ -6601,6 +6997,28 @@ static int walk_job_tree(add_stream_ctx_t *ctx, const add_job_t *job){
                             free(child);
                             break;
                         }
+                    }
+                    free(archive_path);
+                    free(child);
+                    continue;
+                }
+                if(S_ISCHR(child_st.st_mode) || S_ISBLK(child_st.st_mode) || S_ISFIFO(child_st.st_mode)){
+                    /* Special device-like file (char/block/FIFO). Apply same pseudo-root depth restrictions. */
+                    int devdir_depth = -1;
+                    int devdir_match = find_devdir_root(devdir_roots, devdir_root_count, child, &devdir_depth);
+                    if(devdir_match >= 0 && devdir_depth != 1){
+                        free(child);
+                        continue;
+                    }
+                    if(devdir_match < 0 && is_pseudo_path(child) && limit_depth >= 0 && path_relative_depth(job->src_root, child) > limit_depth){
+                        if(!global_quiet) fprintf(stderr, "Skipping device-like path (too deep): %s\n", child);
+                        free(child);
+                        continue;
+                    }
+                    char *archive_path = resolve_archive_path(job, child);
+                    if(!archive_path){ fprintf(stderr, "Out of memory while preparing %s\n", child); free(child); status = 1; continue; }
+                    if(!should_ignore_path(child, archive_path, ctx->ignore_patterns, ctx->ignore_count)){
+                        if(process_single_file(ctx, child, archive_path, job->clevel, &child_st) != 0){ status = 1; free(archive_path); free(child); break; }
                     }
                     free(archive_path);
                     free(child);
@@ -6637,6 +7055,26 @@ static int walk_job_tree(add_stream_ctx_t *ctx, const add_job_t *job){
                 free(archive_path);
             }
         }
+        else if(S_ISLNK(st.st_mode) || S_ISCHR(st.st_mode) || S_ISBLK(st.st_mode) || S_ISFIFO(st.st_mode)){
+            if(is_pseudo_path(current) && limit_depth >= 0){
+                if(path_relative_depth(job->src_root, current) > limit_depth){
+                    free(current);
+                    continue;
+                }
+            }
+            char *archive_path = resolve_archive_path(job, current);
+            if(archive_path){
+                if(!should_ignore_path(current, archive_path, ctx->ignore_patterns, ctx->ignore_count)){
+                    if(process_single_file(ctx, current, archive_path, job->clevel, &st) != 0){
+                        free(archive_path);
+                        free(current);
+                        status = 1;
+                        break;
+                    }
+                }
+                free(archive_path);
+            }
+        }
         free(current);
     }
 
@@ -6644,6 +7082,8 @@ static int walk_job_tree(add_stream_ctx_t *ctx, const add_job_t *job){
         status = 1;
     }
     path_stack_free(&stack);
+    free_devdir_roots(devdir_roots, devdir_root_count);
+    /* resolved_root_buf is on stack so no free required */
     return status;
 }
 
@@ -6825,7 +7265,58 @@ static int list_archive(const char *archive, int json){
         printf("]\n");
     }
     if(!global_quiet && !global_verbose) fprintf(stderr, "\n");
+    if(!global_quiet && !global_verbose) fprintf(stderr, "\n");
     free_index(&idx); fclose(f); return 0;
+}
+
+/* Create intermediate directories for 'path' (mkdir -p style) with mode 0755. */
+static int mkpath_local(const char *path, mode_t mode){
+    if(!path || !*path) return 0;
+    char tmp[PATH_MAX]; strncpy(tmp, path, sizeof(tmp)-1); tmp[sizeof(tmp)-1] = '\0';
+    size_t len = strlen(tmp);
+    if(len == 0) return 0;
+    if(tmp[len-1] == '/') tmp[len-1] = '\0';
+    for(char *p = tmp + 1; *p; p++){
+        if(*p == '/'){
+            *p = '\0';
+            if(mkdir(tmp, mode) != 0 && errno != EEXIST) return -1;
+            *p = '/';
+        }
+    }
+    if(mkdir(tmp, mode) != 0 && errno != EEXIST) return -1;
+    return 0;
+}
+
+static char *compose_extract_path(const char *dest, const char *entry_name){
+    if(!entry_name) return NULL;
+    while(entry_name[0] == '/' && entry_name[1]) entry_name++;
+    if(dest && dest[0]){
+        size_t dest_len = strlen(dest);
+        int need_slash = (dest_len > 0 && dest[dest_len-1] != '/');
+        size_t name_len = strlen(entry_name);
+        size_t total = dest_len + (need_slash ? 1 : 0) + name_len + 1;
+        char *out = malloc(total);
+        if(!out) return NULL;
+        size_t pos = 0;
+        if(dest_len){ memcpy(out + pos, dest, dest_len); pos += dest_len; }
+        if(need_slash){ out[pos++] = '/'; }
+        if(name_len){ memcpy(out + pos, entry_name, name_len); pos += name_len; }
+        out[pos] = '\0';
+        return out;
+    }
+    return strdup(entry_name);
+}
+
+/* Return the meta value for a given key, loading meta if necessary. Returns NULL if not found. */
+static const char *entry_get_meta_val(index_t *idx, entry_t *e, const char *key){
+    if(!idx || !e || !key) return NULL;
+    if(e->meta_n == 0) return NULL;
+    if(!e->meta){ entry_load_meta(idx, e); }
+    if(!e->meta) return NULL;
+    for(uint32_t i=0;i<e->meta_n;i++){
+        if(e->meta[i].key && strcmp(e->meta[i].key, key) == 0) return e->meta[i].value;
+    }
+    return NULL;
 }
 
 
@@ -6869,46 +7360,144 @@ static int search_archive(const char *archive, const char *pattern, int json){
 static int extract_archive(const char *archive, const char *dest, const char *pwd){
     FILE *f = fopen(archive, "rb"); if(!f){ perror("open"); return 1; }
     index_t idx = load_index(f);
+    if(dest && dest[0]){
+        mkpath_local(dest, 0755);
+    }
     uint32_t total_entries = 0; for(uint32_t ii=0; ii<idx.n; ii++) if(!(idx.entries[ii].flags & 4)) total_entries++;
     uint32_t processed_entries = 0;
     for(uint32_t i=0;i<idx.n;i++){
         entry_t *e = &idx.entries[i];
         if(e->flags & 4) continue;
+        const char *ename = entry_get_name(&idx, e);
+        if(!ename){
+            if(!global_quiet) fprintf(stderr, "Skipping entry id %u: missing name\n", e->id);
+            continue;
+        }
         fseek(f, e->data_offset, SEEK_SET);
         unsigned char *enc = malloc(e->comp_size);
         fread(enc,1,e->comp_size,f);
         if(e->flags & 2){ xor_buf(enc, e->comp_size, pwd); }
-        unsigned char *out = NULL;
-        uLong outsz = e->uncomp_size;
-        out = malloc(outsz+1);
-        if(e->flags & 1){
-            int res = uncompress(out, &outsz, enc, e->comp_size);
-            if(res!=Z_OK){ fprintf(stderr,"Decompression failed for %s\n", e->name); free(enc); free(out); continue; }
+        int entry_compressed = entry_is_effectively_compressed(e);
+        size_t outcap = e->uncomp_size;
+        if(!entry_compressed && e->comp_size > outcap){
+            outcap = e->comp_size;
+        }
+        unsigned char *out = malloc(outcap + 1);
+        char *outpath = NULL;
+        if(!out){
+            fprintf(stderr, "Out of memory while extracting %s\n", ename);
+            free(enc);
+            break;
+        }
+        uLong produced = e->uncomp_size;
+        if(entry_compressed){
+            produced = outcap;
+            int res = uncompress(out, &produced, enc, e->comp_size);
+            if(res!=Z_OK){
+                fprintf(stderr,"Decompression failed for %s\n", ename);
+                free(outpath);
+                free(enc); free(out); continue;
+            }
         } else {
-            memcpy(out, enc, e->comp_size);
+            if(e->comp_size > 0){
+                memcpy(out, enc, e->comp_size);
+            }
+            if(!produced) produced = e->comp_size;
         }
 
-        uint32_t crc = crc32(0, out, outsz);
+        uint32_t crc = crc32(0, out, produced);
         if(crc != e->crc32){
-            fprintf(stderr, "CRC mismatch (wrong password or corrupted entry): %s\n", e->name);
+            fprintf(stderr, "CRC mismatch (wrong password or corrupted entry): %s\n", ename);
+            free(outpath);
             free(enc); free(out); continue;
         }
 
-        char outpath[4096];
-        const char *basename = strrchr(e->name, '/');
-        if(basename) basename++; else basename = e->name;
-        if(dest) {
-            snprintf(outpath,sizeof(outpath),"%s/%s", dest, basename);
-            char dcopy[4096]; strncpy(dcopy, dest, sizeof(dcopy)-1); dcopy[sizeof(dcopy)-1]=0; mkdir(dcopy, 0755);
-        } else snprintf(outpath,sizeof(outpath),"%s", basename);
-        FILE *outf = fopen(outpath, "wb");
-        if(!outf){ fprintf(stderr,"Cannot write to %s: %s\n", outpath, strerror(errno)); }
-        else { fwrite(out,1,outsz,outf); fclose(outf); }
+        outpath = compose_extract_path(dest, ename);
+        if(!outpath){
+            fprintf(stderr, "Out of memory while building output path for %s\n", ename);
+            free(enc); free(out); continue;
+        }
+        /* Check for metadata that indicates special type: symlink, fifo, device or dir */
+        const char *baar_type = entry_get_meta_val(&idx, e, "BAAR_TYPE");
+        const char *symlink_target = entry_get_meta_val(&idx, e, "BAAR_SYMLINK_TARGET");
+        const char *maj_s = entry_get_meta_val(&idx, e, "BAAR_DEV_MAJOR");
+        const char *min_s = entry_get_meta_val(&idx, e, "BAAR_DEV_MINOR");
+        /* Ensure parent directory exists */
+        char *parent = strdup(outpath);
+        if(parent){
+            char *trim = parent;
+            size_t plen = strlen(trim);
+            while(plen>0 && trim[plen-1] == '/') trim[--plen] = '\0';
+            char *ps = strrchr(trim, '/');
+            if(ps){
+                *ps = '\0';
+                if(trim[0]) mkpath_local(trim, 0755);
+            } else if(dest && dest[0]){
+                mkpath_local(dest, 0755);
+            }
+            free(parent);
+        }
+
+        if(baar_type && strcmp(baar_type, "SYMLINK") == 0 && symlink_target){
+            /* create symlink */
+            unlink(outpath); /* remove existing */
+            if(symlink(symlink_target, outpath) != 0){ fprintf(stderr, "Cannot create symlink %s -> %s: %s\n", outpath, symlink_target, strerror(errno)); }
+            else {
+                if(e->uid || e->gid){ if(lchown(outpath, (uid_t)e->uid, (gid_t)e->gid) != 0 && geteuid() == 0) { fprintf(stderr, "Warning: lchown failed for %s: %s\n", outpath, strerror(errno)); } }
+                struct timespec times[2]; times[0].tv_nsec = UTIME_NOW; times[1].tv_nsec = UTIME_NOW; /* best-effort; real mtime may not be preserved */
+                /* use utimensat with AT_SYMLINK_NOFOLLOW if available */
+#ifdef UTIME_OMIT
+                if(utimensat(AT_FDCWD, outpath, times, AT_SYMLINK_NOFOLLOW) != 0){ /* ignore error */ }
+#endif
+            }
+        } else if(baar_type && strcmp(baar_type, "FIFO") == 0){
+            /* create FIFO */
+            unlink(outpath);
+            if(mkfifo(outpath, (mode_t)e->mode) != 0){ fprintf(stderr, "Cannot create FIFO %s: %s\n", outpath, strerror(errno)); }
+            else {
+                safe_chown_path(outpath, e->uid, e->gid);
+                /* set mtime */
+                struct utimbuf utb = { .actime = (time_t)e->mtime, .modtime = (time_t)e->mtime };
+                utime(outpath, &utb);
+            }
+        } else if(maj_s && min_s){
+            /* create device node if running as root */
+            unsigned int maj = (unsigned int)strtoul(maj_s, NULL, 10);
+            unsigned int min = (unsigned int)strtoul(min_s, NULL, 10);
+            dev_t dev = makedev(maj, min);
+            mode_t m = (mode_t)((e->mode & 07777u) | S_IFCHR);
+            /* if BAAR_TYPE says BLKDEV, use block */
+            if(baar_type && strcmp(baar_type, "BLKDEV") == 0) m = (mode_t)((e->mode & 07777u) | S_IFBLK);
+            unlink(outpath);
+            if(geteuid() == 0){
+                if(mknod(outpath, m, dev) != 0){ fprintf(stderr, "Cannot mknod %s: %s\n", outpath, strerror(errno)); }
+                else { safe_chown_path(outpath, e->uid, e->gid); if(chmod(outpath, e->mode) != 0) { /* ignore */ } }
+            } else {
+                fprintf(stderr, "Skipping device node %s: need root to create device nodes\n", outpath);
+            }
+        } else if(strlen(ename) > 0 && ename[strlen(ename)-1] == '/'){
+            /* directory */
+            mkpath_local(outpath, (mode_t)e->mode ? (mode_t)e->mode : 0755);
+            safe_chown_path(outpath, e->uid, e->gid);
+            struct utimbuf utb = { .actime = (time_t)e->mtime, .modtime = (time_t)e->mtime };
+            utime(outpath, &utb);
+        } else {
+            FILE *outf = fopen(outpath, "wb");
+            if(!outf){ fprintf(stderr,"Cannot write to %s: %s\n", outpath, strerror(errno)); }
+            else { fwrite(out,1,produced,outf); fclose(outf); }
+            if(outf){ safe_chown_path(outpath, e->uid, e->gid); chmod(outpath, e->mode); struct utimbuf utb = { .actime = (time_t)e->mtime, .modtime = (time_t)e->mtime }; utime(outpath, &utb); }
+        }
+        free(outpath);
         free(enc); free(out);
         processed_entries++;
         if(!global_quiet){
-            if(global_verbose) fprintf(stderr, "Extracted: %s\n", e->name);
-            else { char bn[PATH_MAX]; compact_basename(e->name, bn, sizeof(bn)); unsigned int prog = 0; if(total_entries>0) prog = (unsigned int)(processed_entries * 100ULL / total_entries); fprintf(stderr, "\rExtracting %u/%u: %s (%u%%)\x1b[K", processed_entries, total_entries, bn, prog); fflush(stderr); }
+            if(global_verbose) fprintf(stderr, "Extracted: %s\n", ename);
+            else {
+                char bn[PATH_MAX]; compact_basename(ename, bn, sizeof(bn)); unsigned int prog = 0; if(total_entries>0) prog = (unsigned int)(processed_entries * 100ULL / total_entries);
+                fprintf(stderr, "\rExtracting %u/%u: %s (%u%%)\x1b[K", processed_entries, total_entries, bn, prog); fflush(stderr);
+                /* ensure a newline after the final in-place progress to avoid shell prompt overlap */
+                if(processed_entries == total_entries){ fprintf(stderr, "\n"); fflush(stderr); }
+            }
         }
     }
     free_index(&idx); fclose(f); return 0;
@@ -6921,17 +7510,26 @@ static int extract_single_entry(const char *archive, const char *target_name, co
     index_t idx = load_index(f); int found = 0;
     for (uint32_t i = 0; i < idx.n; i++) {
         entry_t *e = &idx.entries[i];
-        if (strcmp(e->name, target_name) == 0) {
+        const char *ename = entry_get_name(&idx, e);
+        if(!ename) continue;
+        if (strcmp(ename, target_name) == 0) {
             found = 1;
             if (e->flags & 4) { fprintf(stderr, "Entry '%s' is marked as deleted.\n", target_name); break; }
             fseek(f, e->data_offset, SEEK_SET);
             unsigned char *enc = malloc(e->comp_size); fread(enc, 1, e->comp_size, f);
             if (e->flags & 2) { xor_buf(enc, e->comp_size, pwd); }
-            unsigned char *out = malloc(e->uncomp_size + 1); uLong outsz = e->uncomp_size;
-            if (e->flags & 1) {
+            int entry_compressed = entry_is_effectively_compressed(e);
+            size_t outcap = e->uncomp_size;
+            if(!entry_compressed && e->comp_size > outcap){ outcap = e->comp_size; }
+            unsigned char *out = malloc(outcap + 1); uLong outsz = e->uncomp_size;
+            if(entry_compressed){
+                outsz = outcap;
                 int res = uncompress(out, &outsz, enc, e->comp_size);
                 if (res != Z_OK) { fprintf(stderr, "Decompression failed for '%s'.\n", target_name); free(enc); free(out); break; }
-            } else { memcpy(out, enc, e->comp_size); }
+            } else {
+                if(e->comp_size > 0){ memcpy(out, enc, e->comp_size); }
+                if(!outsz) outsz = e->comp_size;
+            }
             uint32_t crc = crc32(0, out, outsz);
             if(crc != e->crc32){ fprintf(stderr, "CRC mismatch (wrong password or corrupted entry): %s\n", target_name); free(enc); free(out); break; }
             FILE *outf = fopen(target_name, "wb");
@@ -6958,21 +7556,32 @@ static int test_archive(const char *archive, const char *pwd, int json){
         for(uint32_t i=0;i<idx.n;i++){
             entry_t *e = &idx.entries[i];
             if(e->flags & 4) continue;
+            const char *ename = entry_get_name(&idx, e);
+            if(!ename) ename = "(unknown)";
             fseek(f, e->data_offset, SEEK_SET);
             unsigned char *enc = malloc(e->comp_size);
             fread(enc,1,e->comp_size,f);
             if(e->flags & 2) xor_buf(enc, e->comp_size, pwd);
-            unsigned char *out = malloc(e->uncomp_size+1);
+            int entry_compressed = entry_is_effectively_compressed(e);
+            size_t outcap = e->uncomp_size;
+            if(!entry_compressed && e->comp_size > outcap){ outcap = e->comp_size; }
+            unsigned char *out = malloc(outcap + 1);
+            if(!out){ printf("%s ERROR\n", ename); ok = 0; free(enc); break; }
             uLong outsz = e->uncomp_size;
             int res = Z_OK;
-            if(e->flags & 1) res = uncompress(out, &outsz, enc, e->comp_size);
-            else { memcpy(out, enc, e->comp_size); }
+            if(entry_compressed){
+                outsz = outcap;
+                res = uncompress(out, &outsz, enc, e->comp_size);
+            } else {
+                if(e->comp_size > 0) memcpy(out, enc, e->comp_size);
+                if(!outsz) outsz = e->comp_size;
+            }
             if(res!=Z_OK || outsz!=e->uncomp_size){
-                printf("%s ERROR\n", e->name); ok=0;
+                printf("%s ERROR\n", ename); ok=0;
             } else {
                 uint32_t crc = crc32(0, out, outsz);
-                if(crc!=e->crc32){ printf("%s ERROR\n", e->name); ok=0; }
-                else printf("%s OK\n", e->name);
+                if(crc!=e->crc32){ printf("%s ERROR\n", ename); ok=0; }
+                else printf("%s OK\n", ename);
             }
             free(enc); free(out);
         }
@@ -6982,26 +7591,37 @@ static int test_archive(const char *archive, const char *pwd, int json){
         for(uint32_t i=0;i<idx.n;i++){
             entry_t *e = &idx.entries[i];
             if(e->flags & 4) continue;
+            const char *ename = entry_get_name(&idx, e);
+            if(!ename) ename = "(unknown)";
             fseek(f, e->data_offset, SEEK_SET);
             unsigned char *enc = malloc(e->comp_size);
             fread(enc,1,e->comp_size,f);
             if(e->flags & 2) xor_buf(enc, e->comp_size, pwd);
-            unsigned char *out = malloc(e->uncomp_size+1);
+            int entry_compressed = entry_is_effectively_compressed(e);
+            size_t outcap = e->uncomp_size;
+            if(!entry_compressed && e->comp_size > outcap){ outcap = e->comp_size; }
+            unsigned char *out = malloc(outcap + 1);
+            if(!out){ free(enc); ok = 0; break; }
             uLong outsz = e->uncomp_size;
             int res = Z_OK;
-            if(e->flags & 1) res = uncompress(out, &outsz, enc, e->comp_size);
-            else { memcpy(out, enc, e->comp_size); }
+            if(entry_compressed){
+                outsz = outcap;
+                res = uncompress(out, &outsz, enc, e->comp_size);
+            } else {
+                if(e->comp_size > 0) memcpy(out, enc, e->comp_size);
+                if(!outsz) outsz = e->comp_size;
+            }
             const char *status = "OK";
             if(res!=Z_OK || outsz!=e->uncomp_size){ status = "ERROR"; ok=0; }
             else {
                 uint32_t crc = crc32(0, out, outsz);
                 if(crc!=e->crc32){ status = "ERROR"; ok=0; }
             }
-            char *ename = escape_json_string(e->name);
+            char *ename_json = escape_json_string(ename);
             if(!first) printf(",");
             first = 0;
-            printf("{\"name\":\"%s\",\"status\":\"%s\"}", ename, status);
-            free(ename);
+            printf("{\"name\":\"%s\",\"status\":\"%s\"}", ename_json ? ename_json : "", status);
+            if(ename_json) free(ename_json);
             free(enc); free(out);
         }
         printf("]\n");
@@ -7046,9 +7666,18 @@ static int cat_entry(const char *archive, uint32_t id, const char *pwd){
             fseek(f, e->data_offset, SEEK_SET);
             unsigned char *buf = malloc(e->comp_size); fread(buf,1,e->comp_size,f);
             if(e->flags & 2 && pwd){ xor_buf(buf, e->comp_size, pwd); }
-            unsigned char *out = malloc(e->uncomp_size+1); uLong outsz = e->uncomp_size;
-            if(e->flags & 1){ int res = uncompress(out, &outsz, buf, e->comp_size); if(res!=Z_OK){ fprintf(stderr,"decompress failed\n"); free(buf); free(out); break; } }
-            else { memcpy(out, buf, e->comp_size); outsz = e->comp_size; }
+            int entry_compressed = entry_is_effectively_compressed(e);
+            size_t outcap = e->uncomp_size;
+            if(!entry_compressed && e->comp_size > outcap){ outcap = e->comp_size; }
+            unsigned char *out = malloc(outcap + 1); uLong outsz = e->uncomp_size;
+            if(entry_compressed){
+                outsz = outcap;
+                int res = uncompress(out, &outsz, buf, e->comp_size);
+                if(res!=Z_OK){ fprintf(stderr,"decompress failed\n"); free(buf); free(out); break; }
+            } else {
+                if(e->comp_size > 0) memcpy(out, buf, e->comp_size);
+                if(!outsz) outsz = e->comp_size;
+            }
             uint32_t crc = crc32(0, out, outsz);
             if(crc != e->crc32){ fprintf(stderr, "CRC mismatch (wrong password or corrupted entry)\n"); free(buf); free(out); break; }
             fwrite(out,1,outsz,stdout);
@@ -7422,6 +8051,7 @@ int main(int argc, char **argv){
             const char **file_paths = malloc(sizeof(char*) * (argc - 3));
             char **ignore_patterns = NULL;
             size_t ignore_count = 0;
+            /* devdir_patterns not used for libarchive mode */
 
             for (int i = 3; i < argc; i++) {
                 if (strcmp(argv[i], "--ignore") == 0) {
@@ -7513,17 +8143,21 @@ int main(int argc, char **argv){
             int job_count = 0;
             char **ignore_patterns = NULL;
             size_t ignore_count = 0;
+            char **devdir_patterns = NULL;
+            size_t devdir_count = 0;
 
             for(int i=3;i<argc;i++){
                 if(strcmp(argv[i],"--ignore")==0){
                     if(i+1 >= argc){
                         fprintf(stderr, "--ignore requires a pattern\n");
                         free_ignore_patterns(ignore_patterns, ignore_count);
+                        free_ignore_patterns(devdir_patterns, devdir_count);
                         return 1;
                     }
                     if(add_ignore_pattern(&ignore_patterns, &ignore_count, argv[i+1]) != 0){
                         fprintf(stderr, "Failed to store ignore pattern\n");
                         free_ignore_patterns(ignore_patterns, ignore_count);
+                        free_ignore_patterns(devdir_patterns, devdir_count);
                         return 1;
                     }
                     i++;
@@ -7531,6 +8165,28 @@ int main(int argc, char **argv){
                     if(add_ignore_pattern(&ignore_patterns, &ignore_count, argv[i] + 9) != 0){
                         fprintf(stderr, "Failed to store ignore pattern\n");
                         free_ignore_patterns(ignore_patterns, ignore_count);
+                        free_ignore_patterns(devdir_patterns, devdir_count);
+                        return 1;
+                    }
+                } else if(strcmp(argv[i], "--devdir") == 0){
+                    if(i+1 >= argc){
+                        fprintf(stderr, "--devdir requires a path or name\n");
+                        free_ignore_patterns(ignore_patterns, ignore_count);
+                        free_ignore_patterns(devdir_patterns, devdir_count);
+                        return 1;
+                    }
+                    if(add_ignore_pattern(&devdir_patterns, &devdir_count, argv[i+1]) != 0){
+                        fprintf(stderr, "Failed to store devdir pattern\n");
+                        free_ignore_patterns(ignore_patterns, ignore_count);
+                        free_ignore_patterns(devdir_patterns, devdir_count);
+                        return 1;
+                    }
+                    i++;
+                } else if(strncmp(argv[i], "--devdir=", 9) == 0){
+                    if(add_ignore_pattern(&devdir_patterns, &devdir_count, argv[i] + 9) != 0){
+                        fprintf(stderr, "Failed to store devdir pattern\n");
+                        free_ignore_patterns(ignore_patterns, ignore_count);
+                        free_ignore_patterns(devdir_patterns, devdir_count);
                         return 1;
                     }
                 }
@@ -7543,8 +8199,10 @@ int main(int argc, char **argv){
                 if(strcmp(argv[i],"--quiet")==0 || strcmp(argv[i],"-q")==0){ continue; }
                 if(strcmp(argv[i],"--verbose")==0 || strcmp(argv[i],"-v")==0){ continue; }
                 if(strcmp(argv[i],"--ignore")==0){ i++; continue; }
+                if(strcmp(argv[i],"--devdir")==0){ i++; continue; }
                 if(argv[i][0] == '-') continue;
                 if(strncmp(argv[i], "--ignore=", 9) == 0){ continue; }
+                if(strncmp(argv[i], "--devdir=", 9) == 0){ continue; }
 
                 char *arg = argv[i];
                 char *level_colon = NULL;
@@ -7601,15 +8259,30 @@ int main(int argc, char **argv){
                     continue;
                 }
                 jobs = tmp;
-                if(is_pseudo_path(src_norm) || (archive_override && is_pseudo_path(archive_override))){
-                    if(!global_quiet) fprintf(stderr, "Skipping pseudo or device path: %s\n", src_norm);
-                    free(src_norm);
-                    if(archive_override) free(archive_override);
-                    continue;
-                }
+                /* Allow pseudo paths (like /dev /proc etc.) to be added by user, but enforce
+                   limited recursion rules in walk_job_tree (we decide how far to descend). */
                 jobs[job_count].src_root = src_norm;
                 jobs[job_count].archive_override = archive_override;
                 jobs[job_count].clevel = file_level;
+                /* Determine dev_dir_mode based on either a default '/dosdevices' name,
+                   or on user-specified patterns (could be full paths or basenames) */
+                jobs[job_count].dev_dir_mode = 0;
+                if (strstr(src_norm, "/dosdevices") != NULL) jobs[job_count].dev_dir_mode = 1;
+                for (size_t dp = 0; dp < devdir_count; dp++) {
+                    const char *pat = devdir_patterns[dp];
+                    if (!pat || !pat[0]) continue;
+                    if (strchr(pat, '/') != NULL) {
+                        char *pat_norm = normalize_path_basic(pat);
+                        if (pat_norm && strcmp(src_norm, pat_norm) == 0) {
+                            jobs[job_count].dev_dir_mode = 1;
+                        }
+                        if (pat_norm) free(pat_norm);
+                    } else {
+                        char basebuf[PATH_MAX];
+                        compact_basename(src_norm, basebuf, sizeof(basebuf));
+                        if (strcmp(basebuf, pat) == 0) jobs[job_count].dev_dir_mode = 1;
+                    }
+                }
                 job_count++;
             }
     if(job_count==0 && !incremental_mode){
@@ -7633,10 +8306,12 @@ int main(int argc, char **argv){
                 fclose(f);
                 if(!global_quiet) fprintf(stderr, "Created empty archive: %s\n", archive);
                 free_ignore_patterns(ignore_patterns, ignore_count);
+                free_ignore_patterns(devdir_patterns, devdir_count);
                 return 0;
             } else {
                 fprintf(stderr, "Failed to create archive: %s\n", archive);
                 free_ignore_patterns(ignore_patterns, ignore_count);
+                free_ignore_patterns(devdir_patterns, devdir_count);
                 return 1;
             }
         } else {
@@ -7644,6 +8319,7 @@ int main(int argc, char **argv){
             fclose(f);
             if(!global_quiet) fprintf(stderr, "Archive already exists: %s\n", archive);
             free_ignore_patterns(ignore_patterns, ignore_count);
+            free_ignore_patterns(devdir_patterns, devdir_count);
             return 0;
         }
         for(int j=0;j<job_count;j++){
@@ -7652,6 +8328,7 @@ int main(int argc, char **argv){
         }
         free(jobs);
         free_ignore_patterns(ignore_patterns, ignore_count);
+        free_ignore_patterns(devdir_patterns, devdir_count);
         return 0;
     }
         if(job_count > 0){
@@ -7668,6 +8345,7 @@ int main(int argc, char **argv){
         free(jobs);
         if(!global_quiet && !global_verbose) fprintf(stderr, "\n");
         free_ignore_patterns(ignore_patterns, ignore_count);
+        free_ignore_patterns(devdir_patterns, devdir_count);
         return res;
     } else if(strcmp(cmd,"l")==0){ return list_archive(archive, json); }
     else if(strcmp(cmd,"search")==0){

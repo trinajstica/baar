@@ -21,6 +21,7 @@
 
 
 
+const char *baar_header_string(void);
 
 bool la_is_supported(const char *path);
 
