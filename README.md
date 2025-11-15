@@ -202,10 +202,10 @@ make
 
 Install to system locations:
 
-By default `make install` installs files under the chosen prefix (default: `/usr/local`).
-You can override the prefix like this: `sudo make PREFIX=/usr install`.
+By default `make install` installs files under the chosen prefix (default: `/usr`).
+You can override the prefix like this: `sudo make PREFIX=/usr/local install`.
 
-Typical install destinations (where `${PREFIX}` defaults to `/usr/local`):
+Typical install destinations (where `${PREFIX}` defaults to `/usr`):
 
 - Binary:
     - ${PREFIX}/bin/baar
@@ -222,17 +222,17 @@ Typical install destinations (where `${PREFIX}` defaults to `/usr/local`):
 Install / uninstall commands:
 
 ```
-# Install the built binary and resources to system locations (default: /usr/local)
+# Install the built binary and resources to system locations (default: /usr)
 sudo make install
 
-# To install into a different prefix (for example /usr), and using DESTDIR for packaging:
-sudo make PREFIX=/usr install
+# To install into a different prefix (for example /usr/local), and using DESTDIR for packaging:
+sudo make PREFIX=/usr/local install
 
 # To install into a staging directory for packaging (recommended for building packages):
-sudo make PREFIX=/usr DESTDIR=/tmp/tmpinst install
+sudo make PREFIX=/usr/local DESTDIR=/tmp/tmpinst install
 
 # To uninstall the files previously installed by `make install` (matches PREFIX used for install):
-sudo make PREFIX=/usr uninstall
+sudo make PREFIX=/usr/local uninstall
 ```
 
 ### Requirements (development packages)

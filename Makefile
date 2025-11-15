@@ -2,7 +2,7 @@ CC = gcc
 # Suppress deprecated-declarations warnings (GTK4 still exposes some deprecated helpers)
 CFLAGS = -O2 -Wall $(PKG_CFLAGS) -Wno-deprecated-declarations
 LDFLAGS = -lz -pthread $(PKG_LIBS) -lcrypto
-PREFIX ?= /usr/local
+PREFIX ?= /usr
 DESTDIR ?=
 
 # use pkg-config for gtk4, json-glib, and libarchive

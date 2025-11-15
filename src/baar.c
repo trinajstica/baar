@@ -53,6 +53,8 @@ static void fmt_size(uint64_t n, char *out, size_t outlen){
 
 #define MAGIC "BAARv1\0"
 #define HEADER_SIZE 32
+#define BAAR_STREAM_THRESHOLD (64ULL * 1024 * 1024)
+#define BAAR_STREAM_CHUNK_SIZE (256 * 1024)
 
 
 #define RESPONSE_OPEN_CREATE 100
@@ -93,6 +95,7 @@ static void free_index(index_t *idx);
 static int rebuild_archive(const char *archive, const uint32_t *exclude_ids, uint32_t exclude_count, int quiet);
 
 static void xor_buf(unsigned char *buf, size_t len, const char *pwd);
+static int stream_copy_file_with_crc(const char *src_path, FILE *dest, const char *pwd, uint64_t *bytes_written, uint32_t *crc_out);
 
 
 static int global_quiet = 0;
@@ -5277,6 +5280,49 @@ static void xor_buf(unsigned char *buf, size_t len, const char *pwd){
     OPENSSL_cleanse(salt_full, sizeof(salt_full));
 }
 
+static int stream_copy_file_with_crc(const char *src_path, FILE *dest, const char *pwd,
+                                     uint64_t *bytes_written, uint32_t *crc_out){
+    FILE *src = fopen(src_path, "rb");
+    if(!src) return -1;
+    unsigned char *chunk = malloc(BAAR_STREAM_CHUNK_SIZE);
+    if(!chunk){
+        fclose(src);
+        errno = ENOMEM;
+        return -1;
+    }
+    uint32_t crc = crc32(0L, Z_NULL, 0);
+    uint64_t total = 0;
+    while(1){
+        size_t readn = fread(chunk, 1, BAAR_STREAM_CHUNK_SIZE, src);
+        if(readn == 0){
+            if(ferror(src)){
+                int err = errno;
+                free(chunk);
+                fclose(src);
+                errno = err;
+                return -1;
+            }
+            break;
+        }
+        crc = crc32(crc, chunk, readn);
+        if(pwd && pwd[0]){ xor_buf(chunk, readn, pwd); }
+        size_t written = fwrite(chunk, 1, readn, dest);
+        if(written != readn){
+            int err = errno;
+            free(chunk);
+            fclose(src);
+            errno = err;
+            return -1;
+        }
+        total += readn;
+    }
+    free(chunk);
+    fclose(src);
+    if(bytes_written) *bytes_written = total;
+    if(crc_out) *crc_out = crc;
+    return 0;
+}
+
 static index_t load_index(FILE *f){
     index_t idx = {0};
     fseek(f,0,SEEK_SET);
@@ -5957,23 +6003,40 @@ static int add_files(const char *archive, filepair_t *filepairs, int *clevels, i
                 sarg = NULL;
             }
 
-            FILE *in = fopen(path, "rb");
-            if(!in){
-                if(spinner_created){ spinner_run = 0; pthread_join(spinner_thread, NULL); }
-                if(sarg) free(sarg);
-                fprintf(stderr, "Cannot open %s: %s\n", path, strerror(errno));
-                continue;
-            }
-
             size_t fsize = (size_t)plan->st.st_size;
             unsigned char *buf = NULL;
-            if(fsize > 0){
+            unsigned char *out = NULL;
+            size_t final_sz = 0;
+            uint32_t crc = 0;
+            int compressed = 0;
+            int streaming_mode = (fsize > BAAR_STREAM_THRESHOLD);
+            if(!streaming_mode && fsize > 0){
                 buf = malloc(fsize);
                 if(!buf){
+                    streaming_mode = 1;
+                }
+            }
+
+            uint64_t data_offset = ftell(f);
+            if(fsize == 0){
+                final_sz = 0;
+                crc = 0;
+            } else if(streaming_mode){
+                if(stream_copy_file_with_crc(path, f, pwd, &final_sz, &crc) != 0){
                     if(spinner_created){ spinner_run = 0; pthread_join(spinner_thread, NULL); }
                     if(sarg) free(sarg);
-                    fclose(in);
-                    fprintf(stderr, "Warning: not enough memory for %s\n", path);
+                    fprintf(stderr, "Cannot process %s: %s\n", path, strerror(errno));
+                    if(buf) free(buf);
+                    continue;
+                }
+                compressed = 0;
+            } else {
+                FILE *in = fopen(path, "rb");
+                if(!in){
+                    if(spinner_created){ spinner_run = 0; pthread_join(spinner_thread, NULL); }
+                    if(sarg) free(sarg);
+                    fprintf(stderr, "Cannot open %s: %s\n", path, strerror(errno));
+                    if(buf) free(buf);
                     continue;
                 }
                 size_t readn = fread(buf,1,fsize,in);
@@ -5985,45 +6048,23 @@ static int add_files(const char *archive, filepair_t *filepairs, int *clevels, i
                     free(buf);
                     continue;
                 }
-            }
-            fclose(in);
-
-            const unsigned char *crc_buf = fsize > 0 ? buf : (const unsigned char*)"";
-            uint32_t crc = crc32(0, crc_buf, fsize);
-            unsigned char *out = NULL;
-            size_t out_sz = 0;
-            int compressed = 0;
-            if(clevel>0 && fsize>0 && buf){
-                unsigned char *tmpout = NULL; size_t tmpoutsz = 0;
-                if(compress_data_level(clevel, buf, fsize, &tmpout, &tmpoutsz)==0){
-                    if(tmpoutsz < fsize){ out = tmpout; out_sz = tmpoutsz; compressed = 1; }
-                    else { free(tmpout); tmpout = NULL; }
+                fclose(in);
+                const unsigned char *crc_buf = buf;
+                crc = crc32(0, crc_buf, fsize);
+                size_t out_sz = 0;
+                if(clevel>0 && fsize>0 && buf){
+                    unsigned char *tmpout = NULL; size_t tmpoutsz = 0;
+                    if(compress_data_level(clevel, buf, fsize, &tmpout, &tmpoutsz)==0){
+                        if(tmpoutsz < fsize){ out = tmpout; out_sz = tmpoutsz; compressed = 1; }
+                        else { free(tmpout); tmpout = NULL; }
+                    }
                 }
-            }
-
-            unsigned char *final = NULL;
-            size_t final_sz = 0;
-            if(compressed){ final = out; final_sz = out_sz; }
-            else { final = buf; final_sz = fsize; }
-
-            unsigned char *enc_buf = NULL;
-            if(final_sz > 0){
-                enc_buf = malloc(final_sz);
-                if(!enc_buf){
-                    if(spinner_created){ spinner_run = 0; pthread_join(spinner_thread, NULL); }
-                    if(sarg) free(sarg);
-                    fprintf(stderr, "Warning: not enough memory while encrypting %s\n", path);
-                    if(out) free(out);
-                    if(buf) free(buf);
-                    continue;
+                unsigned char *final = compressed ? out : buf;
+                final_sz = compressed ? out_sz : fsize;
+                if(final_sz > 0 && pwd && pwd[0]){ xor_buf(final, final_sz, pwd); }
+                if(final_sz > 0){
+                    fwrite(final,1,final_sz,f);
                 }
-                memcpy(enc_buf, final, final_sz);
-                if(pwd && pwd[0]){ xor_buf(enc_buf, final_sz, pwd); }
-            }
-
-            uint64_t data_offset = ftell(f);
-            if(final_sz > 0){
-                fwrite(enc_buf,1,final_sz,f);
             }
 
             idx.entries = realloc(idx.entries, sizeof(entry_t)*(idx.n+1));
@@ -6032,7 +6073,7 @@ static int add_files(const char *archive, filepair_t *filepairs, int *clevels, i
             e->id = idx.next_id++;
             e->name = strdup(archive_path);
             e->flags = (compressed?1:0) | ((pwd&&pwd[0])?2:0);
-            e->comp_level = clevel;
+            e->comp_level = compressed ? clevel : 0;
             e->data_offset = data_offset;
             e->comp_size = final_sz;
             e->uncomp_size = fsize;
@@ -6060,7 +6101,6 @@ static int add_files(const char *archive, filepair_t *filepairs, int *clevels, i
             base_name = base_name ? base_name + 1 : path;
             fprintf(stderr, "%s (%u%%)\n", base_name, percent);
 
-            if(enc_buf) free(enc_buf);
             if(out) free(out);
             if(buf) free(buf);
         }
@@ -6140,86 +6180,18 @@ static int process_single_file(add_stream_ctx_t *ctx,
         }
     }
 
-    FILE *in = fopen(src_path, "rb");
-    if(!in){
-        if(spinner_created){ spinner_run = 0; pthread_join(spinner_thread, NULL); }
-        if(sarg) free(sarg);
-        fprintf(stderr, "Cannot open %s: %s\n", src_path, strerror(errno));
-        return 1;
-    }
-
     unsigned char *buf = NULL;
-    if(fsize > 0){
-        buf = malloc(fsize);
-        if(!buf){
-            if(spinner_created){ spinner_run = 0; pthread_join(spinner_thread, NULL); }
-            if(sarg) free(sarg);
-            fclose(in);
-            fprintf(stderr, "Warning: not enough memory for %s\n", src_path);
-            return 1;
-        }
-        size_t readn = fread(buf,1,fsize,in);
-        if(readn != fsize){
-            if(spinner_created){ spinner_run = 0; pthread_join(spinner_thread, NULL); }
-            if(sarg) free(sarg);
-            fprintf(stderr, "Read error for %s: %s\n", src_path,
-                    ferror(in) ? strerror(errno) : "unexpected end of file");
-            fclose(in);
-            free(buf);
-            return 1;
-        }
-    }
-    fclose(in);
-
-    const unsigned char *crc_buf = (buf && fsize > 0) ? buf : (const unsigned char*)"";
-    uint32_t crc = crc32(0, crc_buf, fsize);
-
     unsigned char *out = NULL;
-    size_t out_sz = 0;
+    size_t final_sz = 0;
+    uint32_t crc = 0;
     int compressed = 0;
-    if(clevel > 0 && fsize > 0 && buf){
-        unsigned char *tmpout = NULL; size_t tmpoutsz = 0;
-        if(compress_data_level(clevel, buf, fsize, &tmpout, &tmpoutsz)==0){
-            if(tmpoutsz < fsize){
-                out = tmpout;
-                out_sz = tmpoutsz;
-                compressed = 1;
-            } else {
-                free(tmpout);
-            }
-        }
-    }
-
-    unsigned char *final = buf;
-    size_t final_sz = fsize;
-    if(out){
-        final = out;
-        final_sz = out_sz;
-    }
-
-    unsigned char *enc_buf = NULL;
-    if(final_sz > 0){
-        enc_buf = malloc(final_sz);
-        if(!enc_buf){
-            if(spinner_created){ spinner_run = 0; pthread_join(spinner_thread, NULL); }
-            if(sarg) free(sarg);
-            fprintf(stderr, "Warning: not enough memory while encrypting %s\n", src_path);
-            if(out) free(out);
-            if(buf) free(buf);
-            return 1;
-        }
-        memcpy(enc_buf, final, final_sz);
-        if(ctx->pwd && ctx->pwd[0]){
-            xor_buf(enc_buf, final_sz, ctx->pwd);
-        }
-    }
+    int streaming_mode = (fsize > BAAR_STREAM_THRESHOLD);
 
     char *archive_name = strdup(archive_path);
     if(!archive_name){
         if(spinner_created){ spinner_run = 0; pthread_join(spinner_thread, NULL); }
         if(sarg) free(sarg);
         fprintf(stderr, "Out of memory while tracking %s\n", archive_path);
-        if(enc_buf) free(enc_buf);
         if(out) free(out);
         if(buf) free(buf);
         return 1;
@@ -6231,7 +6203,6 @@ static int process_single_file(add_stream_ctx_t *ctx,
         if(sarg) free(sarg);
         fprintf(stderr, "Out of memory while expanding index\n");
         free(archive_name);
-        if(enc_buf) free(enc_buf);
         if(out) free(out);
         if(buf) free(buf);
         return 1;
@@ -6242,23 +6213,84 @@ static int process_single_file(add_stream_ctx_t *ctx,
     e->id = ctx->idx->next_id++;
     e->name = archive_name;
     e->flags = (compressed ? 1 : 0) | ((ctx->pwd && ctx->pwd[0]) ? 2 : 0);
-    e->comp_level = clevel;
+    e->comp_level = compressed ? clevel : 0;
 
     fseek(ctx->archive_fp, 0, SEEK_END);
     uint64_t data_offset = ftell(ctx->archive_fp);
-    if(final_sz > 0){
-        size_t written = fwrite(enc_buf,1,final_sz,ctx->archive_fp);
-        if(written != final_sz){
-            fprintf(stderr, "Write error while adding %s\n", src_path);
-            ctx->idx->next_id--;
-            free(e->name);
-            e->name = NULL;
-            if(enc_buf) free(enc_buf);
-            if(out) free(out);
-            if(buf) free(buf);
-            if(spinner_created){ spinner_run = 0; pthread_join(spinner_thread, NULL); }
-            if(sarg) free(sarg);
-            return 1;
+    if(fsize > 0){
+        if(streaming_mode){
+            if(stream_copy_file_with_crc(src_path, ctx->archive_fp, ctx->pwd, &final_sz, &crc) != 0){
+                if(spinner_created){ spinner_run = 0; pthread_join(spinner_thread, NULL); }
+                if(sarg) free(sarg);
+                fprintf(stderr, "Cannot process %s: %s\n", src_path, strerror(errno));
+                if(out) free(out);
+                if(buf) free(buf);
+                return 1;
+            }
+        } else {
+            FILE *in = fopen(src_path, "rb");
+            if(!in){
+                if(spinner_created){ spinner_run = 0; pthread_join(spinner_thread, NULL); }
+                if(sarg) free(sarg);
+                fprintf(stderr, "Cannot open %s: %s\n", src_path, strerror(errno));
+                if(out) free(out);
+                if(buf) free(buf);
+                return 1;
+            }
+            buf = malloc(fsize);
+            if(!buf){
+                if(spinner_created){ spinner_run = 0; pthread_join(spinner_thread, NULL); }
+                if(sarg) free(sarg);
+                fclose(in);
+                fprintf(stderr, "Warning: not enough memory for %s\n", src_path);
+                if(out) free(out);
+                return 1;
+            }
+            size_t readn = fread(buf,1,fsize,in);
+            if(readn != fsize){
+                if(spinner_created){ spinner_run = 0; pthread_join(spinner_thread, NULL); }
+                if(sarg) free(sarg);
+                fprintf(stderr, "Read error for %s: %s\n", src_path,
+                        ferror(in) ? strerror(errno) : "unexpected end of file");
+                fclose(in);
+                free(buf);
+                if(out) free(out);
+                return 1;
+            }
+            fclose(in);
+            crc = crc32(0, buf, fsize);
+            size_t out_sz = 0;
+            if(clevel > 0){
+                unsigned char *tmpout = NULL; size_t tmpoutsz = 0;
+                if(compress_data_level(clevel, buf, fsize, &tmpout, &tmpoutsz)==0){
+                    if(tmpoutsz < fsize){
+                        out = tmpout;
+                        out_sz = tmpoutsz;
+                        compressed = 1;
+                    } else {
+                        free(tmpout);
+                    }
+                }
+            }
+            unsigned char *final = compressed ? out : buf;
+            final_sz = compressed ? out_sz : fsize;
+            if(final_sz > 0 && ctx->pwd && ctx->pwd[0]){
+                xor_buf(final, final_sz, ctx->pwd);
+            }
+            if(final_sz > 0){
+                size_t written = fwrite(final,1,final_sz,ctx->archive_fp);
+                if(written != final_sz){
+                    fprintf(stderr, "Write error while adding %s\n", src_path);
+                    ctx->idx->next_id--;
+                    free(e->name);
+                    e->name = NULL;
+                    if(out) free(out);
+                    if(buf) free(buf);
+                    if(spinner_created){ spinner_run = 0; pthread_join(spinner_thread, NULL); }
+                    if(sarg) free(sarg);
+                    return 1;
+                }
+            }
         }
     }
 
@@ -6292,7 +6324,6 @@ static int process_single_file(add_stream_ctx_t *ctx,
         fflush(stderr);
     }
 
-    if(enc_buf) free(enc_buf);
     if(out) free(out);
     if(buf) free(buf);
     if(!global_quiet && !global_verbose) fprintf(stderr, "\n");
