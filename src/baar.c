@@ -1,5 +1,9 @@
 #define BAAR_HEADER "BAAR v0.32, \xC2\xA9 BArko, 2025"
 
+const char *baar_header_string(void) {
+    return BAAR_HEADER;
+}
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -5165,6 +5169,8 @@ static entry_t *find_entry_by_name_fast(entry_lookup_item_t *items, size_t count
 
 typedef struct {
     FILE *archive_fp;
+    /* canonical on-disk path for the archive we're writing to; used to avoid including the archive itself */
+    char *archive_path_on_disk;
     index_t *idx;
     size_t original_entry_count;
     entry_lookup_item_t *entry_lookup;
@@ -6273,6 +6279,18 @@ static int process_single_file(add_stream_ctx_t *ctx,
         }
         return 0;
     }
+
+    /* Avoid adding the archive file itself if it resides inside the source tree being added.
+       Compare device/inode obtained from stat of the archive path (if available) to the src file stat. */
+    if(ctx && ctx->archive_path_on_disk) {
+        struct stat arch_st;
+        if(stat(ctx->archive_path_on_disk, &arch_st) == 0){
+            if(arch_st.st_ino == st->st_ino && arch_st.st_dev == st->st_dev){
+                if(!global_quiet) fprintf(stderr, "Skipping archive file itself: %s\n", src_path);
+                return 0;
+            }
+        }
+    }
     if(clevel < 0) clevel = 0;
     if(clevel > 3) clevel = 3;
 
@@ -6673,6 +6691,11 @@ static int add_files_streaming(const char *archive, add_job_t *jobs, int job_cou
         .ignore_count = ignore_count
     };
 
+    /* store canonical path of the archive file (on disk) so we can avoid adding it */
+    char *archive_canon = realpath(archive, NULL);
+    if(!archive_canon) archive_canon = strdup(archive);
+    ctx.archive_path_on_disk = archive_canon;
+
     /* Compact CLI mode: print header and a single dynamic info line under it */
     if(!global_quiet && !global_verbose){
         fprintf(stderr, "%s\n", BAAR_HEADER);
@@ -6731,6 +6754,7 @@ static int add_files_streaming(const char *archive, add_job_t *jobs, int job_cou
 
     free(lookup);
     free(entry_seen);
+    if(ctx.archive_path_on_disk) free(ctx.archive_path_on_disk);
 
     int rebuild_status = 0;
     if(!incremental_mode && remove_count > 0 && to_remove){
