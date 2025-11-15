@@ -4822,6 +4822,23 @@ static char *normalize_path_basic(const char *path){
     return out;
 }
 
+static int is_pseudo_path(const char *path){
+    if(!path) return 0;
+    // Normalize leading './' and multiple slashes are already normalized earlier
+    const char *p = path;
+    // if absolute path use immediate matching
+    if(strncmp(p, "/dev", 4) == 0) return 1;
+    if(strncmp(p, "/proc", 5) == 0) return 1;
+    if(strncmp(p, "/sys", 4) == 0) return 1;
+    if(strncmp(p, "/run", 4) == 0) return 1;
+    if(strncmp(p, "/var/run", 8) == 0) return 1;
+    // If path includes "/dev/" as component, skip too (handles dosdevices mapping)
+    if(strstr(p, "/dev/")) return 1;
+    if(strstr(p, "/proc/")) return 1;
+    if(strstr(p, "/sys/")) return 1;
+    return 0;
+}
+
 static void remove_path_recursive(const char *path){
     if(!path || !path[0]) return;
     struct stat st;
@@ -5822,6 +5839,16 @@ static int add_files(const char *archive, filepair_t *filepairs, int *clevels, i
                 }
             }
 
+            // Skip pseudo-device and pseudo-filesystem paths; also skip non-regular types.
+            if(plan->stat_ok){
+                if(!S_ISREG(plan->st.st_mode) || is_pseudo_path(src)){
+                    plan->action = FILE_PLAN_SKIP_ERROR;
+                    if(!global_quiet){
+                        fprintf(stderr, "Skipping special/pseudo file: %s\n", src);
+                    }
+                }
+            }
+
             if(filepairs[i].archive_path){
                 entry_t *existing = find_entry_by_name(entry_lookup, entry_lookup_count, filepairs[i].archive_path);
                 if(existing){
@@ -6138,6 +6165,13 @@ static int process_single_file(add_stream_ctx_t *ctx,
         return 1;
     }
     if(g_abort_requested) return 1;
+    // Skip pseudo files and special device-like files.
+    if(!st || !S_ISREG(st->st_mode) || is_pseudo_path(src_path) || (archive_path && is_pseudo_path(archive_path))){
+        if(!global_quiet){
+            fprintf(stderr, "Skipping special file or pseudo path: %s\n", src_path);
+        }
+        return 0;
+    }
     if(clevel < 0) clevel = 0;
     if(clevel > 3) clevel = 3;
 
@@ -6423,6 +6457,12 @@ static int walk_job_tree(add_stream_ctx_t *ctx, const add_job_t *job){
                     continue;
                 }
                 if(S_ISREG(child_st.st_mode)){
+                    // Skip device/pseudo files like /dev, /proc, /sys and special device nodes
+                    if(is_pseudo_path(child)){
+                        if(!global_quiet) fprintf(stderr, "Skipping special/pseudo path: %s\n", child);
+                        free(child);
+                        continue;
+                    }
                     if(g_abort_requested){
                         free(child);
                         status = 1;
@@ -6456,6 +6496,10 @@ static int walk_job_tree(add_stream_ctx_t *ctx, const add_job_t *job){
             }
             closedir(dir);
         } else if(S_ISREG(st.st_mode)){
+            if(is_pseudo_path(current)){
+                free(current);
+                continue;
+            }
             if(g_abort_requested){
                 free(current);
                 status = 1;
@@ -7370,9 +7414,9 @@ int main(int argc, char **argv){
                 char *last_colon = strrchr(arg, ':');
                 int file_level = clevel;
                 char srcbuf[4096], dstbuf[4096];
-                if(last_colon && last_colon > arg && *(last_colon+1) >= '0' && *(last_colon+1) <= '9' && strlen(last_colon+1) <= 2) {
+                if(last_colon && last_colon > arg && *(last_colon+1) != '/' && *(last_colon+1) >= '0' && *(last_colon+1) <= '9' && strlen(last_colon+1) <= 2) {
                     level_colon = last_colon;
-                } else if(last_colon) {
+                } else if(last_colon && *(last_colon+1) != '/') {
                     dst_colon = last_colon;
                 }
                 if(level_colon){
@@ -7418,6 +7462,12 @@ int main(int argc, char **argv){
                     continue;
                 }
                 jobs = tmp;
+                if(is_pseudo_path(src_norm) || (archive_override && is_pseudo_path(archive_override))){
+                    if(!global_quiet) fprintf(stderr, "Skipping pseudo or device path: %s\n", src_norm);
+                    free(src_norm);
+                    if(archive_override) free(archive_override);
+                    continue;
+                }
                 jobs[job_count].src_root = src_norm;
                 jobs[job_count].archive_override = archive_override;
                 jobs[job_count].clevel = file_level;
