@@ -5231,7 +5231,7 @@ static void *spinner_fn(void *arg){
     const char spin[] = "|/-\\";
     int idx = 0;
     while(*(sa->run)){
-        fprintf(stderr, "\r%s %c", sa->name, spin[idx%4]); fflush(stderr);
+        fprintf(stderr, "\rAdding files: %s %c", sa->name, spin[idx%4]); fflush(stderr);
         idx++;
         struct timespec ts = {0, 120 * 1000 * 1000};
         nanosleep(&ts, NULL);
@@ -5990,13 +5990,16 @@ static int add_files(const char *archive, filepair_t *filepairs, int *clevels, i
 
             volatile int spinner_run = 1;
             spinner_arg_t *sarg = malloc(sizeof(*sarg));
+            const char *spinner_name = path;
+            const char *spinner_base = strrchr(path, '/');
+            if(spinner_base) spinner_name = spinner_base + 1;
             if(sarg){
-                sarg->name = path;
+                sarg->name = spinner_name;
                 sarg->run = &spinner_run;
             }
             pthread_t spinner_thread;
             int spinner_created = 0;
-            if(sarg && global_verbose && pthread_create(&spinner_thread, NULL, spinner_fn, sarg)==0){
+            if(sarg && !global_quiet && pthread_create(&spinner_thread, NULL, spinner_fn, sarg)==0){
                 spinner_created = 1;
             } else if(sarg){
                 free(sarg);
@@ -6167,12 +6170,15 @@ static int process_single_file(add_stream_ctx_t *ctx,
 
     volatile int spinner_run = 1;
     spinner_arg_t *sarg = malloc(sizeof(*sarg));
+    const char *spinner_name = src_path;
+    const char *spinner_base = strrchr(src_path, '/');
+    if(spinner_base) spinner_name = spinner_base + 1;
     pthread_t spinner_thread;
     int spinner_created = 0;
     if(sarg){
-        sarg->name = src_path;
+        sarg->name = spinner_name;
         sarg->run = &spinner_run;
-        if(global_verbose && pthread_create(&spinner_thread, NULL, spinner_fn, sarg)==0){
+        if(!global_quiet && pthread_create(&spinner_thread, NULL, spinner_fn, sarg)==0){
             spinner_created = 1;
         } else {
             free(sarg);
